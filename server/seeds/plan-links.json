@@ -1,0 +1,193 @@
+{
+ "note": "The projects of the tracker (by project code) placed under the projects of the transformation plan by the first boot that finds them unlinked. The PMO can change any link on the Portfolio. low = a guess worth a second look.",
+ "links": {
+  "ACLR": {
+   "initiative": "Asset Lifecycle Model Implementation",
+   "confidence": "low"
+  },
+  "ACRRM": {
+   "initiative": "Third-Party Delivery Order Integrity Implementation",
+   "confidence": "low"
+  },
+  "AIWS": {
+   "initiative": "AI Dispatch Weight Verification System Implementation",
+   "confidence": "high"
+  },
+  "APL": {
+   "initiative": "Approved Product List (APL) Substitute Coverage Expansion",
+   "confidence": "high"
+  },
+  "ASL": {
+   "initiative": "Supplier Specification Compliance Program",
+   "confidence": "low"
+  },
+  "BP27": {
+   "initiative": "Integrated Business Planning Implementation",
+   "confidence": "low"
+  },
+  "BPL": {
+   "initiative": "Integrated Business Planning Implementation",
+   "confidence": "low"
+  },
+  "CCAP": {
+   "initiative": "Internal Audit Program",
+   "confidence": "low"
+  },
+  "COGSM1": {
+   "initiative": "Cost Structure Review Program",
+   "confidence": "low"
+  },
+  "CSO1": {
+   "initiative": "Cost Structure Review Program",
+   "confidence": "high"
+  },
+  "DF": {
+   "initiative": "Demand Planning Model Implementation",
+   "confidence": "high"
+  },
+  "DF2": {
+   "initiative": "Demand Planning Model Implementation",
+   "confidence": "high"
+  },
+  "DTCR 1": {
+   "initiative": "Preventive Maintenance System Implementation",
+   "confidence": "high"
+  },
+  "DTCR 3": {
+   "initiative": "Systems Integration Roadmap Implementation",
+   "confidence": "low"
+  },
+  "DTCR 4": {
+   "initiative": "Internal Controls Framework Implementation",
+   "confidence": "low"
+  },
+  "DTCR 5": {
+   "initiative": "Reporting Automation Implementation",
+   "confidence": "low"
+  },
+  "DTCR 6": {
+   "initiative": "Recruitment Process Redesign",
+   "confidence": "high"
+  },
+  "DVRL": {
+   "initiative": "Data Governance Framework Implementation",
+   "confidence": "low"
+  },
+  "EAPL": {
+   "initiative": "Approved Product List (APL) Substitute Coverage Expansion",
+   "confidence": "high"
+  },
+  "ECS": {
+   "initiative": "Standards Governance Framework Implementation",
+   "confidence": "low"
+  },
+  "ERPFIN1": {
+   "initiative": "ERP Implementation",
+   "confidence": "high"
+  },
+  "ERPSC1": {
+   "initiative": "ERP Implementation",
+   "confidence": "high"
+  },
+  "ERPSC2": {
+   "initiative": "ERP Implementation",
+   "confidence": "high"
+  },
+  "FADMS": {
+   "initiative": "Asset Lifecycle Model Implementation",
+   "confidence": "low"
+  },
+  "FADMS2": {
+   "initiative": "Asset Lifecycle Model Implementation",
+   "confidence": "low"
+  },
+  "FASOP": {
+   "initiative": "Asset Lifecycle Model Implementation",
+   "confidence": "low"
+  },
+  "ICNT": {
+   "initiative": "Inventory Count & Variance Resolution SOP Implementation",
+   "confidence": "high"
+  },
+  "LAT": {
+   "initiative": "Labor Scheduling Model Implementation",
+   "confidence": "low"
+  },
+  "NSO": {
+   "initiative": "Store Rollout Program Management",
+   "confidence": "high"
+  },
+  "SA1": {
+   "initiative": "SWiSH App Experience Redesign",
+   "confidence": "high"
+  },
+  "SBS": {
+   "initiative": "Barcode-Based Receiving & Transfer System Implementation",
+   "confidence": "high"
+  },
+  "SI": {
+   "initiative": "Systems Integration Roadmap Implementation",
+   "confidence": "high"
+  },
+  "SM": {
+   "initiative": "Speed of Service Baseline & Improvement Program",
+   "confidence": "low"
+  },
+  "SSC": {
+   "initiative": "Storage Capacity & Utilization Tracking Implementation",
+   "confidence": "high"
+  },
+  "SSCD": {
+   "initiative": "Supplier Reliability Scorecard Implementation",
+   "confidence": "high"
+  },
+  "SUR": {
+   "initiative": "Kitchen Capacity Planning Model Implementation",
+   "confidence": "low"
+  },
+  "SUR V2.0": {
+   "initiative": "Kitchen Capacity Planning Model Implementation",
+   "confidence": "low"
+  },
+  "TADP": {
+   "initiative": "Recruitment Process Redesign",
+   "confidence": "high"
+  },
+  "WT": {
+   "initiative": "Warehouse Storage Standards Implementation",
+   "confidence": "low"
+  },
+  "CCRP": {
+   "initiative": "Peak Demand Readiness Framework",
+   "confidence": "low"
+  },
+  "DIPDP": {
+   "initiative": "AI Dispatch Weight Verification System Implementation",
+   "confidence": "low"
+  },
+  "DTCR 2": {
+   "initiative": "Process Automation Program Implementation",
+   "confidence": "low"
+  },
+  "DTCR 7": {
+   "initiative": "Self-Service Reporting Enablement",
+   "confidence": "low"
+  },
+  "SKPI": {
+   "initiative": "KPI Cascade Implementation",
+   "confidence": "high"
+  },
+  "SAF": {
+   "initiative": "Recognition Program Implementation",
+   "confidence": "low"
+  },
+  "MPP": {
+   "initiative": "Workforce Planning Model Implementation",
+   "confidence": "high"
+  },
+  "PPOPS": {
+   "initiative": "Delivery Time Reliability Model Implementation",
+   "confidence": "low"
+  }
+ }
+}

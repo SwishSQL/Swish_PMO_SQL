@@ -1,0 +1,35 @@
+# Every push and pull request: type-check, run the tests (the real server on a new empty SQL Server database
+# per run, no company data), and build.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    services:
+      mssql:
+        image: mcr.microsoft.com/mssql/server:2019-latest
+        env:
+          ACCEPT_EULA: Y
+          MSSQL_SA_PASSWORD: Ci_Passw0rd!2026
+        ports:
+          - 1433:1433
+    env:
+      TEST_MSSQL_HOST: localhost
+      TEST_MSSQL_USER: sa
+      TEST_MSSQL_PASSWORD: Ci_Passw0rd!2026
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run check
+      - run: npm test
+      - run: npm run build
