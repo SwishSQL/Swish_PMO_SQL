@@ -63,14 +63,76 @@ function config(): sql.config {
   };
 }
 
+/** A name that is safe to put inside [brackets] in a statement that cannot take parameters (CREATE DATABASE, CREATE LOGIN). */
+function ident(name: string): string {
+  if (!name || /[\x00-\x1f]/.test(name)) throw new Error(`Not a usable SQL Server name: ${JSON.stringify(name)}`);
+  return `[${name.replace(/]/g, ']]')}]`;
+}
+const literal = (text: string) => `N'${text.replace(/'/g, "''")}'`;
+
+/**
+ * First start on a new server: the database (and, when MSSQL_ADMIN_USER / MSSQL_ADMIN_PASSWORD are given, the application's
+ * login with db_owner on it) does not exist yet. Creates what is missing, through `master`. Without the admin settings the
+ * application's own login is used, which works when it may create databases (dbcreator). MSSQL_AUTO_CREATE=false turns it off.
+ */
+async function provision(cfg: sql.config, original: Error): Promise<void> {
+  const admin = process.env.MSSQL_ADMIN_USER;
+  const database = cfg.database as string;
+  const appUser = cfg.user as string | undefined;
+  const master = new sql.ConnectionPool({
+    ...cfg,
+    database: 'master',
+    user: admin || cfg.user,
+    password: admin ? process.env.MSSQL_ADMIN_PASSWORD : cfg.password,
+    pool: { max: 1, min: 0 },
+  });
+  master.on('error', () => undefined);
+  try {
+    await master.connect();
+    await master.request().batch(`IF DB_ID(${literal(database)}) IS NULL CREATE DATABASE ${ident(database)};`);
+    if (admin && appUser && appUser.toLowerCase() !== admin.toLowerCase()) {
+      const login = `IF SUSER_ID(${literal(appUser)}) IS NULL CREATE LOGIN ${ident(appUser)} WITH PASSWORD = ${literal(cfg.password ?? '')}, CHECK_POLICY = OFF;`;
+      await master.request().batch(login);
+      await master.request().batch(
+        `USE ${ident(database)};\n` +
+          `IF USER_ID(${literal(appUser)}) IS NULL CREATE USER ${ident(appUser)} FOR LOGIN ${ident(appUser)};\n` +
+          `ALTER ROLE db_owner ADD MEMBER ${ident(appUser)};`,
+      );
+    }
+    console.log(`[db] created database ${database}${admin ? ' and its login' : ''} on first start`);
+  } catch (error: any) {
+    throw new Error(
+      `Cannot open database "${database}" as ${appUser} (${original.message}) and could not create it (${error.message}). ` +
+        'Check MSSQL_USER / MSSQL_PASSWORD, or ask a DBA to create the database and give the login db_owner on it, or set ' +
+        'MSSQL_ADMIN_USER and MSSQL_ADMIN_PASSWORD (a login that may create databases and logins) for the first start.',
+    );
+  } finally {
+    await master.close().catch(() => undefined);
+  }
+}
+
 let poolPromise: Promise<sql.ConnectionPool> | null = null;
 function pool(): Promise<sql.ConnectionPool> {
   poolPromise ??= (async () => {
-    const p = new sql.ConnectionPool(config());
-    // An idle connection dropped by the server emits 'error'. Unheard, that event crashes the process.
-    p.on('error', (error) => console.error('[db] connection error', error.message));
+    const cfg = config();
+    const open = async () => {
+      const p = new sql.ConnectionPool(cfg);
+      // An idle connection dropped by the server emits 'error'. Unheard, that event crashes the process.
+      p.on('error', (error) => console.error('[db] connection error', error.message));
+      return p.connect();
+    };
     try {
-      return await p.connect();
+      try {
+        return await open();
+      } catch (error: any) {
+        const code = error?.originalError?.number ?? error?.number;
+        // A database that does not exist is reported as 4060 or, more often, as a plain "Login failed" (18456, the reason
+        // is hidden from the client). Either way try `master`: if the login is simply wrong that fails too, with both messages.
+        const fixable = error?.code === 'ELOGIN' || code === 4060 || code === 18456 || /Cannot open database/i.test(error?.message ?? '');
+        if (!fixable || process.env.MSSQL_AUTO_CREATE === 'false' || process.env.SKIP_SCHEMA === '1') throw error;
+        await provision(cfg, error);
+        return await open();
+      }
     } catch (error) {
       poolPromise = null;
       throw error;

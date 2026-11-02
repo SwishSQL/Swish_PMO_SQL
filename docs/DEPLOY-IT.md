@@ -10,8 +10,8 @@ needs to change to run it.
 | --- | --- |
 | Node.js | 22.x |
 | SQL Server | 2019 or newer, SQL authentication enabled (mixed mode) and TCP enabled |
-| A database | an empty one, for example `swish_pmo` |
-| A login | `db_owner` on that database (the application creates its own tables, triggers and indexes) |
+| A database | none to prepare: the server creates it (and every table, trigger and index) on its first start |
+| A login | one that may create databases (`dbcreator`), or an administrator login for the first start only (step 1) |
 | A port | any free one, set with `PORT` (default 8090) |
 | Mail | a mailbox for the system if the emails are wanted (optional, see `.env.example`) |
 
@@ -20,7 +20,15 @@ again at every start).
 
 ## Steps
 
-1. Create the database and the login (SSMS or sqlcmd, as an administrator). Choose your own password:
+1. **Nothing to create by hand.** Put the connection in `.env` (step 3). On its first start the server creates the database
+   `MSSQL_DATABASE` if it is missing. Two ways to give it the right to do that:
+
+   - set `MSSQL_ADMIN_USER` / `MSSQL_ADMIN_PASSWORD` (any administrator login, e.g. `sa`): the server then also creates the
+     application login `MSSQL_USER` / `MSSQL_PASSWORD` with `db_owner` on the new database, and uses that login from then on;
+     delete the two admin lines from `.env` after the first start; or
+   - give `MSSQL_USER` the `dbcreator` server role, and it creates the database it then owns.
+
+   If you prefer to prepare everything yourself, this is what the server would do (SSMS or sqlcmd, as an administrator):
 
    ```sql
    CREATE DATABASE swish_pmo;
