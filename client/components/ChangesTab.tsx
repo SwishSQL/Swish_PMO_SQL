@@ -7,6 +7,8 @@ import { useT } from '../lib/i18n';
 import type { Key as TKey } from '../lib/i18n';
 import { fmtDate, fmtDateTime, fmtNumber } from '../lib/format';
 import { Dialog, Empty, Field } from './ui';
+import { DateInput } from './DateInput';
+import { MentionTextarea } from './MentionTextarea';
 
 const AREAS: ChangeArea[] = ['scope', 'cost', 'schedule'];
 
@@ -214,10 +216,10 @@ function NewChangeDialog({ detail, onClose, onCreated }: { detail: ProjectDetail
           <input className="input" value={fmtDate(meta.today, lang, true)} disabled readOnly />
         </Field>
         <Field label={t('cr_description')} hint={t('cr_descriptionHint')} className="span-2">
-          <textarea className="textarea" dir="auto" value={description} onChange={(e) => setDescription(e.target.value)} />
+          <MentionTextarea className="textarea" dir="auto" value={description} onChange={(e) => setDescription(e.target.value)} />
         </Field>
         <Field label={t('cr_reason')} hint={t('cr_reasonHint')} className="span-2">
-          <textarea className="textarea" dir="auto" value={reason} onChange={(e) => setReason(e.target.value)} />
+          <MentionTextarea className="textarea" dir="auto" value={reason} onChange={(e) => setReason(e.target.value)} />
         </Field>
         <div className="field span-2">
           <span>{t('cr_areas')}</span>
@@ -236,20 +238,20 @@ function NewChangeDialog({ detail, onClose, onCreated }: { detail: ProjectDetail
       <p className="muted" style={{ fontSize: 13, marginTop: 0 }}>{t('cr_proposedHint')}</p>
       <div className="form-grid">
         <Field label={t('cr_newStart')} hint={t('cr_now', { v: fmtDate(p.startDate, lang, true) })}>
-          <input className="input" type="date" min="2000-01-01" max="2100-12-31" value={startDate} onChange={(e) => setStartDate(e.target.value)} />
+          <DateInput className="input" min="2000-01-01" max="2100-12-31" value={startDate} onChange={(e) => setStartDate(e.target.value)} />
         </Field>
         <Field label={t('cr_newEnd')} hint={t('cr_now', { v: fmtDate(p.endDate, lang, true) })}>
-          <input className="input" type="date" min="2000-01-01" max="2100-12-31" value={endDate} onChange={(e) => setEndDate(e.target.value)} />
+          <DateInput className="input" min="2000-01-01" max="2100-12-31" value={endDate} onChange={(e) => setEndDate(e.target.value)} />
         </Field>
         <Field label={t('cr_newBudget')} hint={t('cr_now', { v: p.budget === null ? '-' : fmtNumber(p.budget, lang) })}>
           <input className="input num" inputMode="decimal" value={budget} onChange={(e) => setBudget(e.target.value)} />
         </Field>
         <div />
         <Field label={t('cr_newScope')} className="span-2">
-          <textarea className="textarea" dir="auto" placeholder={detail.project.scope ?? ''} value={scope} onChange={(e) => setScope(e.target.value)} />
+          <MentionTextarea className="textarea" dir="auto" placeholder={detail.project.scope ?? ''} value={scope} onChange={(e) => setScope(e.target.value)} />
         </Field>
         <Field label={t('cr_newObjective')} className="span-2">
-          <textarea className="textarea" dir="auto" placeholder={detail.project.objective ?? ''} value={objective} onChange={(e) => setObjective(e.target.value)} />
+          <MentionTextarea className="textarea" dir="auto" placeholder={detail.project.objective ?? ''} value={objective} onChange={(e) => setObjective(e.target.value)} />
         </Field>
       </div>
 
@@ -269,7 +271,7 @@ function NewChangeDialog({ detail, onClose, onCreated }: { detail: ProjectDetail
               <option value="move">{t('cr_action_move')}</option>
               <option value="cancel">{t('cr_action_cancel')}</option>
             </select>
-            <input className="input" type="date" min="2000-01-01" max="2100-12-31" disabled={m.action !== 'move'} value={m.to} aria-label={t('cr_newDate')} onChange={(e) => setMoves(moves.map((x, j) => (j === i ? { ...x, to: e.target.value } : x)))} />
+            <DateInput className="input" min="2000-01-01" max="2100-12-31" disabled={m.action !== 'move'} value={m.to} aria-label={t('cr_newDate')} onChange={(e) => setMoves(moves.map((x, j) => (j === i ? { ...x, to: e.target.value } : x)))} />
             <button className="btn btn-ghost btn-icon btn-sm" aria-label={t('remove')} onClick={() => setMoves(moves.filter((_, j) => j !== i))}>
               <Trash size={15} />
             </button>
@@ -293,7 +295,7 @@ function NewChangeDialog({ detail, onClose, onCreated }: { detail: ProjectDetail
                 </option>
               ))}
             </select>
-            <input className="input" type="date" min="2000-01-01" max="2100-12-31" aria-label={t('dueDate')} value={m.date} onChange={(e) => setAdded(added.map((x, j) => (j === i ? { ...x, date: e.target.value } : x)))} />
+            <DateInput className="input" min="2000-01-01" max="2100-12-31" aria-label={t('dueDate')} value={m.date} onChange={(e) => setAdded(added.map((x, j) => (j === i ? { ...x, date: e.target.value } : x)))} />
             <button className="btn btn-ghost btn-icon btn-sm" aria-label={t('remove')} onClick={() => setAdded(added.filter((_, j) => j !== i))}>
               <Trash size={15} />
             </button>
@@ -307,10 +309,10 @@ function NewChangeDialog({ detail, onClose, onCreated }: { detail: ProjectDetail
       <h3 className="cr-section">{t('cr_actionsTitle')}</h3>
       <div className="form-grid">
         <Field label={t('cr_actions')} hint={t('cr_actionsHint')} className="span-2">
-          <textarea className="textarea" dir="auto" value={actions} onChange={(e) => setActions(e.target.value)} />
+          <MentionTextarea className="textarea" dir="auto" value={actions} onChange={(e) => setActions(e.target.value)} />
         </Field>
         <Field label={t('cr_actionsDate')}>
-          <input className="input" type="date" min="2000-01-01" max="2100-12-31" value={actionsDate} onChange={(e) => setActionsDate(e.target.value)} />
+          <DateInput className="input" min="2000-01-01" max="2100-12-31" value={actionsDate} onChange={(e) => setActionsDate(e.target.value)} />
         </Field>
       </div>
       <p className="muted" style={{ fontSize: 12.5 }}>{t('cr_approvalNote')}</p>
@@ -526,7 +528,7 @@ function ChangeDialog({ change: c, detail, canKeep, onClose, onChanged, onDelete
 
       {mayDecide && (
         <Field label={t('cr_decisionNote')} hint={t('cr_decisionNoteHint')}>
-          <textarea className="textarea" dir="auto" value={note} onChange={(e) => setNote(e.target.value)} />
+          <MentionTextarea className="textarea" dir="auto" value={note} onChange={(e) => setNote(e.target.value)} />
         </Field>
       )}
 
@@ -535,14 +537,14 @@ function ChangeDialog({ change: c, detail, canKeep, onClose, onChanged, onDelete
           <h3 className="cr-section">{t('cr_log')}</h3>
           <div className="form-grid">
             <Field label={t('cr_progress')} className="span-2">
-              <textarea className="textarea" dir="auto" value={progress} onChange={(e) => setProgress(e.target.value)} />
+              <MentionTextarea className="textarea" dir="auto" value={progress} onChange={(e) => setProgress(e.target.value)} />
             </Field>
             <Field label={t('cr_completion')}>
-              <input className="input" type="date" min="2000-01-01" max="2100-12-31" value={completion} onChange={(e) => setCompletion(e.target.value)} />
+              <DateInput className="input" min="2000-01-01" max="2100-12-31" value={completion} onChange={(e) => setCompletion(e.target.value)} />
             </Field>
             <div />
             <Field label={t('notes')} className="span-2">
-              <textarea className="textarea" dir="auto" value={notes} onChange={(e) => setNotes(e.target.value)} />
+              <MentionTextarea className="textarea" dir="auto" value={notes} onChange={(e) => setNotes(e.target.value)} />
             </Field>
           </div>
           <button

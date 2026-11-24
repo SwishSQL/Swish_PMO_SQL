@@ -2,11 +2,12 @@ import { Router } from 'express';
 import { db } from '../db';
 import { HttpError, can, canGovernProject, canViewProject, requirePermission, route } from '../auth';
 import { closers, notify } from '../notify';
-import { logActivity } from '../service';
+import { assertMilestonesDone, logActivity, resync, setClosureMilestone } from '../service';
 import { idParam, oneOf, optStr } from '../validate';
 import { TEMPLATES, cleanDelivery } from '../delivery';
 import path from 'node:path';
 import fs from 'node:fs';
+import { releaseDependents } from '../projectDeps';
 
 // Closing a project. Nobody marks one finished alone: its owner (or its department head) asks, and a PMO
 // admin (whoever holds "Approve project closure") decides. Approval is what sets the project to Closed.
@@ -20,8 +21,8 @@ closureRouter.get(
     const { rows } = await db.query(
       `SELECT c.id, c.note, c.created_at, c.project_id, c.delivery_url, c.delivery_file_name, c.report_file_name, c.checklist_file_name, p.code, p.name, p.name_ar, p.progress, p.stage, p.health,
               u.name AS requested_by_name,
-              (SELECT COUNT(*) FROM tasks t WHERE t.project_id = p.id AND t.kind = 'milestone'
-                 AND t.status NOT IN ('done', 'cancelled')) AS open_milestones
+              (SELECT COUNT(*) FROM tasks t WHERE t.project_id = p.id AND t.kind = 'milestone' AND t.not_required = 0
+                 AND t.status NOT IN ('done', 'cancelled') AND (t.system_key IS NULL OR t.system_key <> 'closure_docs')) AS open_milestones
          FROM closure_requests c JOIN projects p ON p.id = c.project_id LEFT JOIN users u ON u.id = c.requested_by
         WHERE c.status = 'pending' ORDER BY c.created_at`,
     );
@@ -55,11 +56,11 @@ closureRouter.post(
     if (!(await canGovernProject(req, projectId))) {
       throw new HttpError(403, 'Only the project owner, the head of its department or the PMO can ask to close a project.');
     }
-    const { rows: pr } = await db.query('SELECT name, stage FROM projects WHERE id = $1', [projectId]);
-    if (pr[0].stage === 'closed') throw new HttpError(409, 'This project is already closed.');
-    if (can(req, 'projects.approve_close')) {
-      throw new HttpError(400, 'You can approve closures yourself: set the stage to Closed on the project, no request is needed.');
-    }
+    const { rows: pr } = await db.query('SELECT name, stage, health FROM projects WHERE id = $1', [projectId]);
+    if (pr[0].health === 'done') throw new HttpError(409, 'This project is already closed.');
+    await assertMilestonesDone(db, projectId);
+    // Whoever approves closures closes it at once: the same documents, kept as an approved closure.
+    const direct = can(req, 'projects.approve_close');
     const note = optStr(req.body?.note, 'Note', 1000) ?? '';
     // A project does not finish without its closure report and its signed sign-off checklist.
     const delivery = cleanDelivery(req.body);
@@ -67,18 +68,35 @@ closureRouter.post(
     try {
       created = await db.query(
         `INSERT INTO closure_requests (project_id, requested_by, note, delivery_url, delivery_file_name, delivery_file_type, delivery_file,
-            report_file_name, report_file_type, report_file, checklist_file_name, checklist_file_type, checklist_file)
+            report_file_name, report_file_type, report_file, checklist_file_name, checklist_file_type, checklist_file, status, decided_by, decided_at)
          OUTPUT INSERTED.id
-         VALUES ($1, $2, $3, $4, $5, $6, CAST($7 AS VARBINARY(MAX)), $8, $9, CAST($10 AS VARBINARY(MAX)), $11, $12, CAST($13 AS VARBINARY(MAX)))`,
+         VALUES ($1, $2, $3, $4, $5, $6, CAST($7 AS VARBINARY(MAX)), $8, $9, CAST($10 AS VARBINARY(MAX)), $11, $12, CAST($13 AS VARBINARY(MAX)), $14, $15, $16)`,
         [
           projectId, req.user!.id, note, delivery.url, delivery.file?.name ?? null, delivery.file?.type ?? null, delivery.file?.data ?? null,
           delivery.report.name, delivery.report.type, delivery.report.data, delivery.checklist.name, delivery.checklist.type, delivery.checklist.data,
+          direct ? 'approved' : 'pending', direct ? req.user!.id : null, direct ? new Date() : null,
         ],
       );
     } catch (e) {
       if (/closure_one_pending_idx|unique/i.test((e as Error).message)) throw new HttpError(409, 'A request to close this project is already waiting for the PMO.');
       throw e;
     }
+    if (direct) {
+      await db.tx(async (q) => {
+        await q.query(`UPDATE projects SET stage = 'closure', health = 'done', updated_at = SYSDATETIMEOFFSET() WHERE id = $1`, [projectId]);
+        await setClosureMilestone(q, projectId, 'done');
+        await resync(q, projectId);
+        await logActivity(q, projectId, req.user!.id, 'closure.approved', { name: pr[0].name, note, direct: true, report: delivery.report.name, checklist: delivery.checklist.name });
+      });
+      await releaseDependents(projectId, req.user!.id);
+      res.status(201).json({ id: created.rows[0].id, closed: true });
+      return;
+    }
+    // The documents are in: the closure documents milestone waits for the PMO.
+    await db.tx(async (q) => {
+      await setClosureMilestone(q, projectId, 'in_progress');
+      await resync(q, projectId);
+    });
     await logActivity(db, projectId, req.user!.id, 'closure.requested', { name: pr[0].name, note, deliveryUrl: delivery.url, deliveryFile: delivery.file?.name ?? null, report: delivery.report.name, checklist: delivery.checklist.name });
     await notify(db, await closers(db), { kind: 'closure.requested', projectId, data: { name: pr[0].name, by: req.user!.name, note, delivery: [delivery.report.name, delivery.checklist.name, delivery.url ?? delivery.file?.name].filter(Boolean).join(', ') } }, req.user!.id);
     res.status(201).json({ id: created.rows[0].id });
@@ -133,14 +151,19 @@ closureRouter.post(
     if (!c) throw new HttpError(404, 'Request not found.');
     if (c.status !== 'pending') throw new HttpError(409, 'This request was already decided.');
     if (c.requested_by === req.user!.id) throw new HttpError(403, 'You cannot decide on your own request.');
+    if (decision === 'approve') await assertMilestonesDone(db, c.project_id);
     await db.tx(async (q) => {
       await q.query(
         `UPDATE closure_requests SET status = $2, decided_by = $3, decided_at = SYSDATETIMEOFFSET(), decision_note = $4 WHERE id = $1`,
         [id, decision === 'approve' ? 'approved' : 'rejected', req.user!.id, decisionNote],
       );
       if (decision === 'approve') {
-        await q.query(`UPDATE projects SET stage = 'closed', health = 'done', updated_at = SYSDATETIMEOFFSET() WHERE id = $1`, [c.project_id]);
+        await q.query(`UPDATE projects SET stage = 'closure', health = 'done', updated_at = SYSDATETIMEOFFSET() WHERE id = $1`, [c.project_id]);
+        await setClosureMilestone(q, c.project_id, 'done');
+      } else {
+        await setClosureMilestone(q, c.project_id, 'todo');
       }
+      await resync(q, c.project_id);
       await logActivity(q, c.project_id, req.user!.id, decision === 'approve' ? 'closure.approved' : 'closure.rejected', {
         name: c.project_name,
         note: decisionNote,
@@ -151,6 +174,7 @@ closureRouter.post(
       projectId: c.project_id,
       data: { name: c.project_name, decision, by: req.user!.name, note: decisionNote },
     }, req.user!.id);
+    if (decision === 'approve') await releaseDependents(c.project_id, req.user!.id);
     res.json({ ok: true });
   }),
 );

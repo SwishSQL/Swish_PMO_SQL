@@ -3,6 +3,7 @@ import { ArrowRight } from '@phosphor-icons/react';
 import { useT } from '../lib/i18n';
 import { fmtDate } from '../lib/format';
 import { Dialog, Field } from './ui';
+import { MentionTextarea } from './MentionTextarea';
 
 /**
  * A milestone's deadline is a commitment, so moving it asks why. The answer is kept with the move
@@ -52,7 +53,7 @@ export function ReasonDialog({
           </div>
         </div>
         <Field label={t('whyMoved')} hint={needsApproval ? t('whyMovedPending') : t('whyMovedHint')}>
-          <textarea className="textarea" value={reason} onChange={(e) => setReason(e.target.value)} />
+          <MentionTextarea className="textarea" value={reason} onChange={(e) => setReason(e.target.value)} />
         </Field>
       </div>
     </Dialog>

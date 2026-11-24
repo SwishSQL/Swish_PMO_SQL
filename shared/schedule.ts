@@ -53,12 +53,14 @@ export function rollUp<T extends TaskLike>(tasks: T[]): T[] {
     if (node.kind === 'summary' && kids.length === 0) return { start: node.startDate, end: node.endDate, w: 0, done: 0 };
     if (node.kind !== 'summary') {
       // A milestone keeps its own date and status; the tasks that lead to it widen what its phase spans and
-      // count as work of their own.
+      // count as work of their own. Its % is theirs (weighted by length): nobody types it by hand.
       const own = weight(node);
       let start = node.startDate;
       let end = node.endDate;
       let w = own;
       let done = own * doneShare(node);
+      let kidsW = 0;
+      let kidsDone = 0;
       for (const k of kids) {
         const r = visit(k);
         if (!r) continue;
@@ -66,7 +68,10 @@ export function rollUp<T extends TaskLike>(tasks: T[]): T[] {
         if (r.end > end) end = r.end;
         w += r.w;
         done += r.done;
+        kidsW += r.w;
+        kidsDone += r.done;
       }
+      if (node.kind === 'milestone' && kidsW > 0) node.progress = node.status === 'done' ? 100 : Math.round((kidsDone / kidsW) * 100);
       return { start, end, w, done };
     }
     let start = '';

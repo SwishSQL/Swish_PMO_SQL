@@ -1,8 +1,10 @@
 import { useEffect, useRef, useState } from 'react';
-import { ArrowSquareOut, CaretRight, FileArrowUp, LinkSimple } from '@phosphor-icons/react';
+import { ArrowSquareOut, CaretRight, FileArrowUp, LinkSimple, PencilSimple, Plus, Sparkle, WarningCircle } from '@phosphor-icons/react';
 import type { Capability, Health, Initiative, PlanLink, ProjectSummary } from '../../shared/types';
 import { api } from '../api';
-import { useApp, useToast } from '../lib/app';
+import { navigate, useApp, useToast } from '../lib/app';
+import { NewProjectDialog, presetFrom } from './NewProject';
+import { AiProjectDialog } from './AiProject';
 import { useT } from '../lib/i18n';
 import { fmtDate, projectName } from '../lib/format';
 import { spotlight, stagger } from '../lib/motion';
@@ -120,6 +122,7 @@ function GroupCard({ title, sub, inits, byId, href, i }: { title: string; sub: s
 
 /** The capabilities, or the dimensions of one capability, as cards. */
 export function GroupGrid({ plan, level, byId, query }: { plan: Capability[]; level: Level; byId: Map<number, ProjectSummary>; query: string }) {
+  const { meta } = useApp();
   const { t } = useT();
   const q = query.trim().toLowerCase();
   const hit = (name: string, inits: Initiative[]) => !q || name.toLowerCase().includes(q) || inits.some((i) => i.name.toLowerCase().includes(q));
@@ -130,7 +133,7 @@ export function GroupGrid({ plan, level, byId, query }: { plan: Capability[]; le
           .filter((c) => hit(c.name, c.dimensions.flatMap((d) => d.initiatives)))
           .map((c, i) => {
             const inits = c.dimensions.flatMap((d) => d.initiatives);
-            return <GroupCard key={c.id} i={i} title={c.name} sub={t('planCapabilitySub', { d: c.dimensions.length, p: inits.length })} inits={inits} byId={byId} href={`#/portfolio/c/${c.id}`} />;
+            return <GroupCard key={c.id} i={i} title={c.name} sub={`${t('planCapabilitySub', { d: c.dimensions.length, p: inits.length })}${c.managerUserId ? ` · ${meta.users.find((u) => u.id === c.managerUserId)?.name ?? ''}` : ''}`} inits={inits} byId={byId} href={`#/portfolio/c/${c.id}`} />;
           })}
       </div>
     );
@@ -142,9 +145,96 @@ export function GroupGrid({ plan, level, byId, query }: { plan: Capability[]; le
       {cap.dimensions
         .filter((d) => hit(d.name, d.initiatives))
         .map((d, i) => (
-          <GroupCard key={d.id} i={i} title={d.name} sub={t('planDimensionSub', { p: d.initiatives.length })} inits={d.initiatives} byId={byId} href={`#/portfolio/d/${d.id}`} />
+          <GroupCard key={d.id} i={i} title={d.name} sub={`${t('planDimensionSub', { p: d.initiatives.length })}${d.managerUserId ? ` · ${meta.users.find((u) => u.id === d.managerUserId)?.name ?? ''}` : ''}`} inits={d.initiatives} byId={byId} href={`#/portfolio/d/${d.id}`} />
         ))}
     </div>
+  );
+}
+
+/**
+ * A plan project with no project yet: a popup says so, shows what the workbook knows, and starts its project
+ * with the assistant or by hand, under the same name and linked to it. Its own page stays one link away.
+ */
+export function EmptyPlanDialog({ it, onClose, showDetails = true }: { it: Initiative; onClose: () => void; showDetails?: boolean }) {
+  const { t } = useT();
+  const { meta, canCreateIn, can } = useApp();
+  const [how, setHow] = useState<'ai' | 'manual' | null>(null);
+  // A project manager starts a plan project nobody has started yet (the plan shows them only those, and theirs).
+  const mayCreate = meta.departments.some((d) => canCreateIn(d.id)) || can('projects.start_plan');
+  const done = (id: number) => {
+    setHow(null);
+    onClose();
+    navigate(`/projects/${id}/plan`);
+  };
+  // Closing the form closes the popup as well: going back to the choice looked like the close button did nothing.
+  if (how === 'ai') return <AiProjectDialog preset={presetFrom(it)} onClose={onClose} onCreated={done} />;
+  if (how === 'manual') return <NewProjectDialog preset={presetFrom(it)} onClose={onClose} onCreated={done} />;
+  const facts: [string, string | null][] = [
+    [t('manager'), it.owner],
+    [t('planOutcome'), it.outcome],
+    [t('planKpi'), it.outcomeKpi],
+    [t('planTarget'), it.target],
+    [t('planTargetCompletion'), it.targetCompletion],
+  ];
+  return (
+    <Dialog
+      title={it.name}
+      onClose={onClose}
+      width={560}
+      footer={
+        <>
+          {showDetails && (
+            <a className="btn btn-ghost" href={`#/portfolio/i/${it.id}`} onClick={onClose} style={{ marginInlineEnd: 'auto' }}>
+              {t('planViewDetails')}
+            </a>
+          )}
+          {mayCreate && (
+            <>
+              <button className="btn" onClick={() => setHow('manual')}>
+                <PencilSimple size={15} aria-hidden />
+                {t('planCreateManual')}
+              </button>
+              <button className="btn btn-primary" onClick={() => setHow('ai')}>
+                <Sparkle size={15} weight="fill" aria-hidden />
+                {t('planCreateAi')}
+              </button>
+            </>
+          )}
+        </>
+      }
+    >
+      <p className="empty-plan-note">
+        <WarningCircle size={18} weight="fill" aria-hidden />
+        <span>{mayCreate ? t('planEmptyNote') : t('planEmptyAskHead')}</span>
+      </p>
+      <dl className="plan-fields" style={{ marginTop: 12 }}>
+        {facts
+          .filter(([, v]) => v)
+          .map(([k, v]) => (
+            <div key={k}>
+              <dt>{k}</dt>
+              <dd dir="auto">{v}</dd>
+            </div>
+          ))}
+      </dl>
+    </Dialog>
+  );
+}
+
+/** The Create project button of an empty plan project: opens the same popup. */
+function StartProject({ it, big }: { it: Initiative; big?: boolean }) {
+  const { t } = useT();
+  const { meta, canCreateIn, can } = useApp();
+  const [open, setOpen] = useState(false);
+  if (!meta.departments.some((d) => canCreateIn(d.id)) && !can('projects.start_plan')) return null;
+  return (
+    <>
+      <button className={`btn ${big ? 'btn-primary' : 'btn-sm'}`} onClick={(e) => (e.preventDefault(), setOpen(true))}>
+        <Plus size={14} weight="bold" aria-hidden />
+        {t('planStartProject')}
+      </button>
+      {open && <EmptyPlanDialog it={it} onClose={() => setOpen(false)} showDetails={!big} />}
+    </>
   );
 }
 
@@ -153,14 +243,24 @@ export function InitiativeList({ inits, byId, query }: { inits: Initiative[]; by
   const { t, lang } = useT();
   const q = query.trim().toLowerCase();
   const shown = inits.filter((i) => !q || i.name.toLowerCase().includes(q) || i.projectIds.some((id) => (byId.get(id)?.name ?? '').toLowerCase().includes(q)));
+  const [emptyOpen, setEmptyOpen] = useState<Initiative | null>(null);
   return (
     <div className="plan-list">
+      {emptyOpen && <EmptyPlanDialog it={emptyOpen} onClose={() => setEmptyOpen(null)} />}
       {shown.map((it, n) => {
         const projects = projectsOf([it], byId);
         return (
           <div key={it.id} className="panel plan-item enter" style={stagger(n)}>
             <div className="plan-item-head">
-              <a href={`#/portfolio/i/${it.id}`} className="plan-item-title">
+              <a
+                href={`#/portfolio/i/${it.id}`}
+                className="plan-item-title"
+                onClick={(e) => {
+                  if (projects.length > 0) return;
+                  e.preventDefault();
+                  setEmptyOpen(it);
+                }}
+              >
                 {it.name}
               </a>
               <div className="plan-item-tags">
@@ -169,6 +269,7 @@ export function InitiativeList({ inits, byId, query }: { inits: Initiative[]; by
                 {it.owner && <span className="tag">{it.owner}</span>}
                 {it.targetCompletion && <span className="tag num">{it.targetCompletion}</span>}
                 {projects.length === 0 && <span className="tag muted">{t('planNotStarted')}</span>}
+                {projects.length === 0 && <StartProject it={it} />}
               </div>
             </div>
             {projects.length > 0 && (
@@ -240,7 +341,12 @@ export function InitiativeDetail({ it, byId, projects, onLinked }: { it: Initiat
         </dl>
       </div>
       <h2 className="plan-section">{t('planDeliveredBy', { n: linked.length })}</h2>
-      {linked.length === 0 && <p className="muted">{t('planNoProjects')}</p>}
+      {linked.length === 0 && (
+        <div style={{ display: 'flex', alignItems: 'center', gap: 12, flexWrap: 'wrap' }}>
+          <p className="muted" style={{ margin: 0 }}>{t('planNoProjects')}</p>
+          <StartProject it={it} big />
+        </div>
+      )}
       <ul className="plan-projects plan-projects-big">
         {linked.map((p) => (
           <li key={p.id}>
@@ -290,11 +396,14 @@ export function LinkDialog({ plan, onClose, onSaved }: { plan: Capability[]; onC
   const [rows, setRows] = useState<PlanLink[] | null>(null);
   const [chosen, setChosen] = useState<Record<number, number | ''>>({});
   const [busy, setBusy] = useState(false);
+  // By default only the projects not linked yet: what is left to do. A project linked here stays in view until saved.
+  const [onlyUnlinked, setOnlyUnlinked] = useState(true);
   useEffect(() => {
     api
       .get<PlanLink[]>('/api/transformation/links')
       .then((r) => {
         setRows(r);
+        if (!r.some((x) => !x.initiativeId)) setOnlyUnlinked(false);
         setChosen(Object.fromEntries(r.map((x) => [x.projectId, x.initiativeId ?? ''])));
       })
       .catch((e) => toast((e as Error).message, 'bad'));
@@ -331,6 +440,12 @@ export function LinkDialog({ plan, onClose, onSaved }: { plan: Capability[]; onC
       <p className="muted" style={{ marginTop: 0, fontSize: 13 }}>
         {t('planLinkHint')}
       </p>
+      {rows && (
+        <label style={{ display: 'inline-flex', alignItems: 'center', gap: 8, margin: '0 0 12px', fontSize: 14, cursor: 'pointer' }}>
+          <input type="checkbox" checked={onlyUnlinked} onChange={(e) => setOnlyUnlinked(e.target.checked)} />
+          {t('planOnlyUnlinked', { n: rows.filter((r) => !r.initiativeId).length, all: rows.length })}
+        </label>
+      )}
       {!rows ? (
         <div className="skeleton" style={{ height: 240, borderRadius: 12 }} />
       ) : (
@@ -343,7 +458,14 @@ export function LinkDialog({ plan, onClose, onSaved }: { plan: Capability[]; onC
               </tr>
             </thead>
             <tbody>
-              {rows.map((r) => {
+              {rows.filter((r) => !onlyUnlinked || !r.initiativeId).length === 0 && (
+                <tr>
+                  <td colSpan={2} className="muted">
+                    {t('planAllLinked')}
+                  </td>
+                </tr>
+              )}
+              {rows.filter((r) => !onlyUnlinked || !r.initiativeId).map((r) => {
                 const value = chosen[r.projectId] ?? '';
                 return (
                   <tr key={r.projectId} className={(value || null) !== (r.initiativeId ?? null) ? 'plan-link-changed' : ''}>

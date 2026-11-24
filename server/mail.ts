@@ -1,5 +1,9 @@
 import nodemailer from 'nodemailer';
 import type { Transporter } from 'nodemailer';
+import { briefingEmail } from './briefingEmail';
+import type { BriefingData } from './briefingEmail';
+import { FONT, HEALTH, INK, LINE, MUTED, callout, details, emailShell, esc, paragraph, section } from './emailLayout';
+import { replyAddress } from './inbound';
 
 // Sending mail, for the password a new person is emailed the first time they sign in. Settings come from the
 // environment only (the .env file or the service settings), never from code or the database:
@@ -50,13 +54,16 @@ function getTransport(): Transporter {
   return transport;
 }
 
-export async function sendMail(to: string, subject: string, text: string, html: string): Promise<void> {
+/** Replies go to the inbound address with this recipient's tag, when replies are set up (see inbound.ts). */
+export async function sendMail(to: string, subject: string, text: string, html: string, thread?: { inReplyTo?: string; ref?: string }): Promise<void> {
   await getTransport().sendMail({
     from: setting('MAIL_FROM') || setting('SMTP_USER'),
     to,
+    replyTo: replyAddress(to, thread?.ref),
     subject,
     text,
     html,
+    ...(thread?.inReplyTo ? { inReplyTo: thread.inReplyTo, references: thread.inReplyTo } : {}),
   });
 }
 
@@ -75,21 +82,38 @@ export function assignmentEmail(
         : `${p.by} started the project ${proj} in your department.`;
   const subject =
     kind === 'task.assigned' ? 'SWiSH PMO: a task was given to you' : kind === 'project.owner' ? 'SWiSH PMO: you own a project' : 'SWiSH PMO: a project in your department';
-  return layout(first, news, p.url, subject);
+  const title = kind === 'task.assigned' ? 'A task is yours' : kind === 'project.owner' ? 'You own a project' : 'A new project in your department';
+  const rows: [string, string][] = kind === 'task.assigned' ? [['Task', p.name], ['Project', proj], ['Given by', p.by]] : [['Project', proj], [kind === 'project.owner' ? 'Given by' : 'Started by', p.by]];
+  return layout(first, news, p.url, subject, { title, rows });
 }
 
-/** The shared look of an event email: greeting, the news, a button, and how to stop them. */
-function layout(first: string, news: string, url: string, subject: string, label = 'Open in SWiSH PMO'): { subject: string; text: string; html: string } {
-  const text = [`Hello ${first},`, '', news, url ? `Open it: ${url}` : '', '', 'You can stop these emails from the notifications panel in the system.']
+/**
+ * The shared look of an event email: the dark header with its title, the greeting, the news in a callout, the
+ * details in a card, a button, and how to stop them. The plain-text part says the same in sentences.
+ */
+function layout(
+  first: string,
+  news: string,
+  url: string,
+  subject: string,
+  o: { title: string; rows?: [string, string][]; label?: string; tone?: 'info' | 'decision' },
+): { subject: string; text: string; html: string } {
+  const label = o.label ?? 'Open in SWiSH PMO';
+  const text = [`Hello ${first},`, '', news, url ? `${label}: ${url}` : '', '', 'You can stop these emails from the notifications panel in the system.']
     .filter((l, i, a) => l !== '' || a[i - 1] !== '')
     .join('\n');
-  const button = url ? `<p><a href="${esc(url)}" style="display:inline-block;background:#14181d;color:#fff;text-decoration:none;border-radius:8px;padding:10px 16px;font-weight:600">${esc(label)}</a></p>` : '';
-  const html = `<div style="font:15px/1.6 Segoe UI,Arial,sans-serif;color:#14181d;max-width:520px">
-<p>Hello ${esc(first)},</p>
-<p>${esc(news)}</p>
-${button}
-<p style="color:#5b6573;font-size:12px">You can stop these emails from the notifications panel in the system.</p>
-</div>`;
+  const html = emailShell({
+    subject,
+    title: o.title,
+    preheader: news,
+    rows: [
+      paragraph(`Hello ${esc(first)},`),
+      o.tone === 'decision' ? callout(esc(news), HEALTH.at_risk.color, HEALTH.at_risk.tint) : callout(esc(news)),
+      details(o.rows ?? []),
+    ],
+    button: url ? { label, url } : undefined,
+    footer: 'You can stop these emails from the notifications panel in the system.',
+  });
   return { subject, text, html };
 }
 
@@ -106,7 +130,12 @@ export function eventEmail(
       `${p.by} asks to move the deadline of "${p.name}" (${proj}) from ${p.from} to ${p.to}. Reason: ${p.reason}. It waits for your decision.`,
       p.url,
       'SWiSH PMO: a deadline change needs your decision',
-      'Decide in SWiSH PMO',
+      {
+        title: 'A deadline change needs your decision',
+        tone: 'decision',
+        rows: [['Milestone', p.name], ['Project', proj], ['Deadline', `${p.from}  →  ${p.to}`], ['Reason', p.reason], ['Asked by', p.by]],
+        label: 'Decide in SWiSH PMO',
+      },
     );
   }
   if (kind === 'change.pending') {
@@ -115,7 +144,12 @@ export function eventEmail(
       `${p.by} asks for a change to the project ${proj} (${p.codes}): ${p.name}. Reason: ${p.reason}. It waits for your approval.`,
       p.url,
       'SWiSH PMO: a change request waits for your approval',
-      'Review the change',
+      {
+        title: 'A change request waits for your approval',
+        tone: 'decision',
+        rows: [['Change', p.name], ['Project', proj], ['Request', p.codes], ['Reason', p.reason], ['Asked by', p.by]],
+        label: 'Review the change',
+      },
     );
   }
   if (kind === 'closure.requested') {
@@ -124,13 +158,32 @@ export function eventEmail(
       `${p.by} asks to close the project ${proj}.${p.note ? ` Note: ${p.note}.` : ''}${p.delivery ? ` Delivery document: ${p.delivery}` : ''} It waits for your approval.`,
       p.url,
       'SWiSH PMO: a project waits for closure approval',
-      'Review in SWiSH PMO',
+      {
+        title: 'A project waits for closure approval',
+        tone: 'decision',
+        rows: [['Project', proj], ['Note', p.note], ['Delivery document', p.delivery], ['Asked by', p.by]],
+        label: 'Review in SWiSH PMO',
+      },
     );
   }
-  return layout(first, `Your weekly update is still due for: ${p.codes}.`, p.url, 'SWiSH PMO: your weekly update is due', 'Write the update');
+  return layout(first, `Your weekly update is still due for: ${p.codes}.`, p.url, 'SWiSH PMO: your weekly update is due', {
+    title: 'Your weekly update is due',
+    tone: 'decision',
+    rows: [['Projects', p.codes]],
+    label: 'Write the update',
+  });
 }
 
-const esc = (s: string) => s.replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c] as string);
+/** The weekly reminder: the full projects briefing when there is one (AI summary, charts), else the plain reminder. */
+export function weeklyEmail(
+  p: { who: string; codes: string; url: string },
+  brief: Omit<BriefingData, 'who' | 'url' | 'updateDue'> | null,
+): { subject: string; text: string; html: string } {
+  if (!brief || (!brief.summary && !brief.priorities.length)) {
+    return eventEmail('reminder.weekly', { who: p.who, by: '', project: '', code: '', name: '', from: '', to: '', reason: '', note: '', codes: p.codes, delivery: '', url: p.url });
+  }
+  return briefingEmail({ ...brief, who: p.who, url: p.url, updateDue: p.codes });
+}
 
 /** The email that carries a temporary password. */
 export function passwordEmail(name: string, password: string, hours: number): { subject: string; text: string; html: string } {
@@ -147,13 +200,121 @@ export function passwordEmail(name: string, password: string, hours: number): { 
     `Sign in with your company email and this password${url ? ` at ${url}` : ''}. You will then be asked to choose your own password. This one works for ${hours} hours and is replaced as soon as you choose yours.`,
     'If you did not ask for it, you can ignore this email: nobody can sign in without it.',
   ].join('\n');
-  const mono = 'font:600 20px/1.4 Consolas,Menlo,monospace;letter-spacing:1px;background:#f2f4f7;border-radius:8px;padding:12px 16px;display:inline-block;direction:ltr';
-  const html = `<div style="font:15px/1.6 Segoe UI,Arial,sans-serif;color:#14181d;max-width:520px">
-<p>Hello ${esc(first)},</p>
-<p>Your temporary password for <b>SWiSH PMO</b>:</p>
-<p><span style="${mono}">${esc(password)}</span></p>
-<p>Sign in with your company email and this password${url ? ` at <a href="${esc(url)}">${esc(url)}</a>` : ''}. You will then be asked to choose your own password. This one works for ${hours} hours and is replaced as soon as you choose yours.</p>
-<p style="color:#5b6573">If you did not ask for it, you can ignore this email: nobody can sign in without it.</p>
-</div>`;
+  const mono = "font-family:Consolas,Menlo,'Courier New',monospace;font-size:22px;font-weight:700;letter-spacing:2px;color:#14181d;direction:ltr";
+  const html = emailShell({
+    subject,
+    title: 'Your temporary password',
+    preheader: 'Your temporary password for SWiSH PMO',
+    rows: [
+      paragraph(`Hello ${esc(first)},<br>here is your temporary password for <b>SWiSH PMO</b>:`),
+      `<tr><td align="center" style="padding:20px 32px 0 32px"><table role="presentation" cellpadding="0" cellspacing="0" border="0" style="background:#f2f4f7;border:1px dashed #c3cad3;border-radius:10px" bgcolor="#f2f4f7"><tr><td style="padding:14px 26px;${mono}">${esc(password)}</td></tr></table></td></tr>`,
+      paragraph(
+        `Sign in with your company email and this password. You will then be asked to choose your own password. This one works for <b>${hours} hours</b> and is replaced as soon as you choose yours.`,
+      ),
+    ],
+    button: url ? { label: 'Sign in to SWiSH PMO', url } : undefined,
+    footer: 'If you did not ask for it, you can ignore this email: nobody can sign in without it.',
+  });
+  return { subject, text, html };
+}
+
+/** A new account (or a reset password): the one-time link to choose a password, sent to the person only. */
+export function setupEmail(p: { name: string; email: string; url: string; expires: Date; reset: boolean; by: string }): { subject: string; text: string; html: string } {
+  const first = p.name.split(/\s+/)[0] || p.name;
+  const until = p.expires.toLocaleString('en-GB', { day: 'numeric', month: 'short', year: 'numeric', hour: '2-digit', minute: '2-digit', timeZone: 'Asia/Kuwait' });
+  const subject = p.reset ? 'Set a new password for SWiSH PMO' : 'Your SWiSH PMO account is ready';
+  const lead = p.reset
+    ? `${p.by} reset your SWiSH PMO password. Choose a new one with the button below.`
+    : `${p.by} created your SWiSH PMO account. Choose your password with the button below to sign in.`;
+  const text = [
+    `Hello ${first},`,
+    '',
+    lead,
+    '',
+    `Your sign-in email: ${p.email}`,
+    `Choose your password: ${p.url}`,
+    '',
+    `The link works once, until ${until} (Kuwait time). If it has expired, ask the PMO to send a new one.`,
+  ].join('\n');
+  const html = emailShell({
+    subject,
+    title: p.reset ? 'Set a new password' : 'Your account is ready',
+    preheader: lead,
+    rows: [
+      paragraph(`Hello ${esc(first)},<br>${esc(lead)}`),
+      paragraph(`Your sign-in email: <b dir="ltr">${esc(p.email)}</b>`),
+    ],
+    button: { label: p.reset ? 'Choose a new password' : 'Choose your password', url: p.url },
+    footer: `The link works once, until ${esc(until)} (Kuwait time). If it has expired, ask the PMO to send a new one. If you did not expect this email, you can ignore it.`,
+  });
+  return { subject, text, html };
+}
+
+/** The admin's test email: proves the mailbox works, in the same look as the real ones. */
+export function testEmail(): { subject: string; text: string; html: string } {
+  const subject = 'SWiSH PMO: test email';
+  const news = 'This is a test from SWiSH PMO. If you can read it, the system can email people their first password.';
+  return {
+    subject,
+    text: news,
+    html: emailShell({ subject, title: 'Test email', preheader: news, rows: [callout(esc(news))], footer: 'Sent from Users & permissions in SWiSH PMO.' }),
+  };
+}
+
+/** The answer to a question someone emailed in reply to the system: read only, from what they may see. */
+export function answerEmail(p: {
+  who: string;
+  subject: string;
+  question: string;
+  answer: string;
+  projects: { code: string; name: string; url: string }[];
+  /** A change waiting for YES, done, or refused by the system: the header and the colour say which. */
+  kind?: 'answer' | 'confirm' | 'done' | 'refused';
+}): {
+  subject: string;
+  text: string;
+  html: string;
+} {
+  const first = p.who.split(/\s+/)[0] || p.who;
+  const subject = /^re:/i.test(p.subject.trim()) ? p.subject.trim() : `Re: ${p.subject.trim() || 'SWiSH PMO'}`;
+  const kind = p.kind ?? 'answer';
+  const footer =
+    kind === 'answer'
+      ? 'Answered by AI from the project data you can see in SWiSH PMO; check it in the system before acting. Reply to ask another question, or to ask for a change.'
+      : 'Changes asked for by email are made only after you reply YES, with your own permissions in SWiSH PMO, and are recorded under your name.';
+  const tone: Record<string, [string, string] | undefined> = { confirm: [HEALTH.at_risk.color, HEALTH.at_risk.tint], done: [HEALTH.on_track.color, HEALTH.on_track.tint], refused: [HEALTH.off_track.color, HEALTH.off_track.tint] };
+  // Arabic answers are laid out right to left; Outlook ignores dir="auto", so it is decided here.
+  const block = (s: string, size: number, color: string) => {
+    const rtl = /[؀-ۿ]/.test(s);
+    return `<p dir="${rtl ? 'rtl' : 'ltr'}" style="margin:0;${FONT};font-size:${size}px;line-height:${Math.round(size * 1.55)}px;color:${color};text-align:${rtl ? 'right' : 'left'}">${esc(s).replace(/\n/g, '<br>')}</p>`;
+  };
+  const links = p.projects.length
+    ? section(
+        'Projects in this answer',
+        `<table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="border:1px solid ${LINE};border-radius:10px;border-collapse:separate">${p.projects
+          .map(
+            (x, i) =>
+              `<tr><td style="padding:10px 14px;${i ? `border-top:1px solid ${LINE};` : ''}${FONT};font-size:14px;color:${INK}"><b style="color:${MUTED}">${esc(x.code)}</b>&nbsp; ${x.url ? `<a href="${esc(x.url)}" style="color:#0f766e;text-decoration:none">${esc(x.name)}</a>` : esc(x.name)}</td></tr>`,
+          )
+          .join('')}</table>`,
+      )
+    : '';
+  const html = emailShell({
+    subject,
+    title: { answer: 'Your answer', confirm: 'Please confirm', done: 'Done', refused: 'Not done' }[kind],
+    preheader: p.answer,
+    rows: [paragraph(`Hello ${esc(first)},`), callout(block(p.answer, 15, INK), ...(tone[kind] ?? [])), section('You asked', block(p.question, 13, MUTED)), links],
+    footer,
+  });
+  const text = [
+    `Hello ${first},`,
+    '',
+    p.answer,
+    ...(p.projects.length ? ['', ...p.projects.map((x) => `- ${x.code} ${x.name}${x.url ? `: ${x.url}` : ''}`)] : []),
+    '',
+    `You asked: ${p.question}`,
+    '',
+    footer,
+  ].join('\n');
   return { subject, text, html };
 }

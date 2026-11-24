@@ -1,10 +1,13 @@
-import { useMemo } from 'react';
+import { useMemo, useState } from 'react';
+import { countsAsMilestone } from '../../shared/kpi';
 import { ArrowRight, Hourglass, WarningOctagon, CalendarCheck, Siren, Flag, ChartDonut, Megaphone, SealQuestion } from '@phosphor-icons/react';
 import type { MilestoneRow, ProjectSummary } from '../../shared/types';
 import { addDays, weekStart } from '../../shared/dates';
 import { milestoneFlags, STALE_DAYS, WARNING_DAYS } from '../../shared/health';
 import { api } from '../api';
 import { useApp, useLoad } from '../lib/app';
+import { ALL_DATES, DateRange, inRange, overlaps } from '../components/DateRange';
+import type { Range } from '../components/DateRange';
 import { useT } from '../lib/i18n';
 import type { Key as TKey } from '../lib/i18n';
 import { fmtDate, projectName, relativeDays } from '../lib/format';
@@ -12,6 +15,7 @@ import { CountUp, stagger } from '../lib/motion';
 import { ClosureQueue } from '../components/ClosureQueue';
 import { ChangeQueue } from '../components/ChangeQueue';
 import { ErrorState, ExportButton, HealthBadge, Meter, PageSkeleton, Person } from '../components/ui';
+import { LearnMore } from '../components/Tour';
 
 /**
  * The weekly review in numbers: how many milestones are late, stale, or heading
@@ -23,12 +27,15 @@ export function Dashboard() {
   const { meta, user, can } = useApp();
   const { t, lang } = useT();
   const today = meta.today;
+  const [dates, setDates] = useState<Range>(ALL_DATES);
   const ms = useLoad(() => api.get<MilestoneRow[]>('/api/milestones'), [], 'milestones');
   const pr = useLoad(() => api.get<ProjectSummary[]>('/api/projects'), [], 'projects-all');
 
   const view = useMemo(() => {
     if (!ms.data || !pr.data) return null;
-    const rows = ms.data.map((m) => ({ m, f: milestoneFlags(m, today) }));
+    // The milestones that count: required ones of active projects (shared/kpi.ts), as on the Portfolio and the report.
+    const rows = ms.data.filter((m) => countsAsMilestone(m) && inRange(m.date, dates)).map((m) => ({ m, f: milestoneFlags(m, today) }));
+    const projects = pr.data.filter((p) => overlaps(p.startDate, p.endDate, dates));
     const open = rows.filter((r) => r.f.open);
     const weekEnd = addDays(today, 7);
     const sum = {
@@ -67,7 +74,7 @@ export function Dashboard() {
       const p = perProject.get(r.m.projectId);
       if (p && r.m.lastUpdateOn && (!p.last || r.m.lastUpdateOn > p.last)) p.last = r.m.lastUpdateOn;
     }
-    const active = pr.data.filter((p) => p.health !== 'done');
+    const active = projects.filter((p) => p.health !== 'done');
     const health = {
       on_track: active.filter((p) => p.health === 'on_track').length,
       at_risk: active.filter((p) => p.health === 'at_risk').length,
@@ -77,8 +84,8 @@ export function Dashboard() {
     const review = active
       .map((p) => ({ p, c: perProject.get(p.id) ?? { overdue: 0, stale: 0, warning: 0, last: null } }))
       .sort((a, b) => b.c.overdue - a.c.overdue || b.c.warning - a.c.warning || b.c.stale - a.c.stale || a.p.code.localeCompare(b.p.code));
-    return { sum, exceptions, weeks, health, review, activeCount: active.length, total: pr.data.length };
-  }, [ms.data, pr.data, today]);
+    return { sum, exceptions, weeks, health, review, activeCount: active.length, total: projects.length };
+  }, [ms.data, pr.data, today, dates]);
 
   if (ms.error || pr.error) return <ErrorState message={(ms.error ?? pr.error)!} onRetry={() => (ms.reload(), pr.reload())} />;
   if (!view) return <PageSkeleton />;
@@ -112,9 +119,11 @@ export function Dashboard() {
       <div className="page-head">
         <div>
           <h1 className="page-title">{t('dashboard')}</h1>
+          <LearnMore page="dashboard" />
           <p className="page-sub">{t('dashboardSub', { a: view.activeCount, n: view.total })}</p>
         </div>
         <div className="toolbar">
+          <DateRange value={dates} onChange={setDates} today={today} />
           <ExportButton url="/api/export/portfolio.xlsx?quarter=all">{t('exportExcel')}</ExportButton>
         </div>
       </div>

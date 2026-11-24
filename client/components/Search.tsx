@@ -41,7 +41,7 @@ export function SearchButton({ pages }: { pages: PageLink[] }) {
   }, []);
   return (
     <>
-      <button className="search-trigger" onClick={() => setOpen(true)} aria-label={t('searchAll')} aria-keyshortcuts={isMac ? 'Meta+K' : 'Control+K'}>
+      <button className="search-trigger" onClick={() => setOpen(true)} aria-label={t('searchAll')} title={t('searchAll')} aria-keyshortcuts={isMac ? 'Meta+K' : 'Control+K'}>
         <MagnifyingGlass size={16} aria-hidden />
         <span>{t('searchAll')}</span>
         <kbd>{isMac ? '⌘K' : 'Ctrl K'}</kbd>

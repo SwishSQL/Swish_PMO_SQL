@@ -8,17 +8,18 @@ export type { Permission } from './permissions';
 export type { Holiday } from './calendar';
 
 export type Health = 'not_started' | 'on_track' | 'at_risk' | 'off_track' | 'done';
-export type Stage = 'initiation' | 'planning' | 'execution' | 'closure' | 'closed';
+/** The five stages of the project lifecycle. A finished project is in Closure with health Done (set by approving its closure). */
+export type Stage = 'initiation' | 'planning' | 'execution' | 'monitoring' | 'closure';
 export type Priority = 'critical' | 'high' | 'medium' | 'low';
 export type TaskKind = 'summary' | 'task' | 'milestone';
 export type TaskStatus = 'todo' | 'in_progress' | 'blocked' | 'done' | 'cancelled';
 export type RiskKind = 'risk' | 'issue';
 export type Level = 'low' | 'medium' | 'high';
 export type RiskStatus = 'open' | 'mitigating' | 'closed';
-export type NoteKind = 'comment' | 'decision' | 'action';
+export type NoteKind = 'comment' | 'decision' | 'action' | 'blocker' | 'decision_needed';
 
 export const HEALTHS: Health[] = ['on_track', 'at_risk', 'off_track', 'not_started', 'done'];
-export const STAGES: Stage[] = ['initiation', 'planning', 'execution', 'closure', 'closed'];
+export const STAGES: Stage[] = ['initiation', 'planning', 'execution', 'monitoring', 'closure'];
 export const PRIORITIES: Priority[] = ['critical', 'high', 'medium', 'low'];
 
 export interface User {
@@ -33,6 +34,8 @@ export interface User {
   pending: boolean;
   /** When the current setup link stops working (pending accounts only). */
   inviteExpiresAt: string | null;
+  /** False while the setup email has not gone out (held until launch). */
+  setupEmailed?: boolean;
   /** The admin who made the current setup link (pending accounts only). */
   inviteIssuedBy: number | null;
   lastLoginAt: string | null;
@@ -40,6 +43,14 @@ export interface User {
   owner: boolean;
   /** Manages accounts and permissions, like the owner. The owner always is one. */
   systemAdmin: boolean;
+  /** The AI project manager does not remind them (set by the PMO). */
+  aiPaused?: boolean;
+  /** Finished or skipped the guided tour. */
+  tourDone?: boolean;
+  /** Page tours finished or skipped. */
+  toursSeen?: string[];
+  /** On leave until this day: no reminders. */
+  awayUntil?: string | null;
 }
 
 export interface RoleDef {
@@ -61,6 +72,17 @@ export interface ProjectDraft {
   priority: Priority;
   objective: string;
   scope: string;
+  /** What each stage must state before the project is created (shared/stageRequirements.ts). */
+  problemStatement: string;
+  stakeholders: string;
+  businessCase: string;
+  budget: string;
+  resources: string;
+  riskPlan: string;
+  deliverables: string;
+  successMetric: string;
+  successTarget: string;
+  acceptanceCriteria: string;
   startDate: string;
   endDate: string;
   /** The fixed phases the project needs (shared/phases.ts); the others are created marked Not required. */
@@ -105,12 +127,16 @@ export interface Dimension {
   id: number;
   capabilityId: number;
   name: string;
+  /** The program manager (watches the projects of this program). */
+  managerUserId: number | null;
   initiatives: Initiative[];
 }
 
 export interface Capability {
   id: number;
   name: string;
+  /** The portfolio manager (watches the projects of this portfolio). */
+  managerUserId: number | null;
   dimensions: Dimension[];
 }
 
@@ -219,7 +245,12 @@ export interface Quarter {
 }
 
 export interface ProjectSummary {
+  /** The AI project manager follows this project up. */
+  aiPmEnabled?: boolean;
+  aiPmSince?: string | null;
   id: number;
+  /** Open projects it waits for before it may start (empty when free). */
+  blockedBy?: { id: number; code: string; name: string }[];
   /** The project of the transformation plan this project delivers (Capability > Dimension > plan project). */
   initiativeId: number | null;
   code: string;
@@ -237,6 +268,10 @@ export interface ProjectSummary {
   startDate: string;
   endDate: string;
   baselineEnd: string | null;
+  /** The committed finish: the latest baseline date of its items (else the project's own baseline). */
+  baselineFinish: string | null;
+  /** Days the baselined items now finish after (+) or before (-) that; null without a baseline. */
+  baselineSlip: number | null;
   progress: number;
   budget: number | null;
   milestones: MilestoneLite[];
@@ -263,12 +298,21 @@ export interface Project extends ProjectSummary {
   gate: string | null;
   successMetric: string | null;
   successTarget: string | null;
+  problemStatement: string | null;
+  stakeholders: string | null;
+  businessCase: string | null;
+  resources: string | null;
+  riskPlan: string | null;
+  deliverables: string | null;
+  acceptanceCriteria: string | null;
   createdAt: string;
   updatedAt: string;
 }
 
 export interface Task {
   id: number;
+  /** A milestone the system keeps in every plan: 'closure_docs' (the documents that prove the project is done). */
+  systemKey?: string | null;
   projectId: number;
   parentId: number | null;
   kind: TaskKind;
@@ -326,11 +370,19 @@ export interface StatusUpdate {
 
 export interface MeetingNote {
   id: number;
-  updateId: number;
+  updateId: number | null;
   kind: NoteKind;
   body: string;
   authorId: number | null;
   createdAt: string;
+  projectId: number | null;
+  week: string | null;
+  /** An action's owner and due date; done once it is closed. */
+  ownerId: number | null;
+  dueDate: string | null;
+  doneAt: string | null;
+  ownerName?: string | null;
+  authorName?: string | null;
 }
 
 export interface Risk {
@@ -356,14 +408,60 @@ export interface Activity {
   createdAt: string;
 }
 
+/** A project another one waits for. */
+/** Engagement & delivery insights for one person (the PMO sees all of it; each person sees label and tip). */
+export interface PersonInsight {
+  userId: number;
+  name: string;
+  title: string | null;
+  department: string | null;
+  /** Open milestones given to them now. */
+  load: number;
+  /** Milestones due in the period. */
+  items: number;
+  onTimePct: number;
+  updatesOnTimePct: number;
+  /** Average days from a reminder or escalation to their next update; null when none reached them. */
+  replyDays: number | null;
+  delayCausedDays: number;
+  score: number | null;
+  label: 'strong' | 'on_track' | 'attention' | 'not_enough';
+  tip: 'deadlines' | 'updates' | 'replies' | 'dependencies' | null;
+  summary: string;
+}
+
+/** One thing the AI project manager did on a project. */
+export interface AiPmEntry {
+  id: number;
+  taskId: number | null;
+  action: 'reminder' | 'escalation' | 'weekly_draft' | string;
+  message: string;
+  createdAt: string;
+}
+
+export interface ProjectLink {
+  id: number;
+  code: string;
+  name: string;
+  endDate: string;
+  /** Not closed yet (and not archived). */
+  open: boolean;
+  /** The waiting project had already started when linked: shown, not frozen. */
+  startedBefore: boolean;
+}
+
 export interface ProjectDetail {
   project: Project;
+  /** The projects this one waits for (set by the PMO). */
+  dependsOn: ProjectLink[];
   members: Member[];
   tasks: Task[];
   dependencies: Dependency[];
   updates: StatusUpdate[];
   risks: Risk[];
   activity: Activity[];
+  /** Everything noted in the weekly meetings, oldest first. */
+  meetingNotes: MeetingNote[];
   /** The latest request to close this project, if there ever was one. */
   closure: ClosureRequest | null;
 }
@@ -396,6 +494,11 @@ export interface MilestoneRow {
   openEscalations: number;
   /** Deadline changes waiting for the project manager or the PMO. */
   pendingChanges: number;
+  /** False when this person may see the milestone but not open it (not theirs). */
+  openable?: boolean;
+  /** Given to the viewer, as owner or co-owner. */
+  mine?: boolean;
+  notRequired?: boolean;
 }
 
 /** One report posted on a task or milestone: the state after it, and what was said. */
@@ -456,6 +559,10 @@ export interface DirectoryEntry {
 
 export interface Meta {
   me: User;
+  /** Set while a PMO admin views the app as "me": the admin's name. Nothing is saved meanwhile. */
+  viewingAs?: { by: string } | null;
+  /** This sign-in, as an opaque marker (the pop-up opens afresh on a new sign-in). */
+  session?: string;
   /** When my password was last set, and the admin whose setup link set it (null: I changed it myself). */
   myPassword: { setAt: string | null; viaLinkFrom: string | null };
   permissions: Permission[];
@@ -466,6 +573,8 @@ export interface Meta {
   emailSignIn: boolean;
   /** Owner or system admin: may add accounts and edit roles. */
   canManageUsers: boolean;
+  /** Manages a portfolio or a program of the transformation plan (watches its projects). */
+  managesPlan: boolean;
   roles: RoleDef[];
   users: User[];
   departments: Department[];
@@ -474,4 +583,85 @@ export interface Meta {
   today: string;
   /** Official holidays, oldest first (the weekend is Friday and Saturday without rows). */
   holidays: Holiday[];
+}
+
+/** A person's role on a project team: a fixed list, so reports and filters read one way. The project manager is the
+ * project owner and is never picked; everyone else gets one of the others ('Member' by default). */
+export const TEAM_ROLES = ['Project manager', 'Team lead', 'Member', 'Subject matter expert', 'Stakeholder / Reviewer', 'PMO coordinator'] as const;
+export type TeamRole = (typeof TEAM_ROLES)[number];
+
+/** One step of a project's escalation ladder: project manager, department head (or initiative owner), PMO, executives. */
+export interface EscalationStep {
+  level: 1 | 2 | 3 | 4 | 5 | 6;
+  role: 'pm' | 'program' | 'portfolio' | 'pmo' | 'ibe' | 'ceo';
+  /** Who it goes to, as shown and recorded. */
+  name: string;
+  /** False when nobody on this step has an account: they would not be told. */
+  hasAccount: boolean;
+}
+
+/** Something waiting for this person to act on, shown in the "Needs your action" pop-up. */
+/** Someone in the staff directory (the org chart), with or without an account. */
+export interface StaffMember {
+  id: number;
+  empNo: string | null;
+  name: string;
+  email: string | null;
+  departmentId: number | null;
+  position: string | null;
+  /** Their direct manager, in the directory. */
+  managerId: number | null;
+  /** The account with the same email, if any. */
+  userId: number | null;
+  active: boolean;
+  /** On the Board of Directors: their title there (Chairman of the Board, Board Member), and their order. */
+  boardTitle: string | null;
+  boardRank: number | null;
+}
+
+/** A request for an owner from outside the project's department, waiting for that department (or a system admin). */
+export interface OwnerRequest {
+  id: number;
+  taskId: number;
+  taskName: string;
+  projectId: number;
+  projectCode: string;
+  projectName: string;
+  departmentId: number;
+  departmentName: string;
+  /** department: its head picks; person: their head approves; new: a system admin creates the account. */
+  kind: 'department' | 'person' | 'new';
+  userId: number | null;
+  userName: string | null;
+  newEmail: string | null;
+  requestedBy: string | null;
+  requestedAt: string;
+  status: 'pending' | 'approved' | 'declined' | 'cancelled';
+  note: string | null;
+  /** In the inbox: the people of that department the head may pick. */
+  candidates?: { id: number; name: string }[];
+}
+
+export interface MyAction {
+  /** Stable per item and state: a new level or a new count is a new key, so it shows again. */
+  key: string;
+  kind: 'escalation' | 'date_change' | 'change_request' | 'closure' | 'baseline' | 'due' | 'no_owner' | 'owner_request' | 'can_start' | 'mention' | 'note';
+  projectId: number;
+  projectCode: string;
+  taskId?: number;
+  title: string;
+  level?: number;
+  /** Working days the escalation has waited. */
+  days?: number;
+  date?: string;
+  count?: number;
+  /** A baseline item: the plan has never been baselined. */
+  first?: boolean;
+  /** A mention: the notification it comes from (read when opened), who wrote and what. */
+  noteId?: number;
+  /** A notice: the notification it shows (its kind and data). */
+  noteKind?: string;
+  noteData?: Record<string, unknown>;
+  by?: string;
+  excerpt?: string;
 }

@@ -451,8 +451,40 @@ path. Projects that already exist are left as they are.
 
 Besides work given to you, two things that wait for you are also emailed (same switch in the notifications panel): **a deadline change to decide**
 (to the project manager, with the task and the reason) and **a project closure to approve** (to the approvers, with the delivery document). And once a week, on
-**Wednesday at 8:00 Kuwait time**, each project manager who still owes the weekly update for the week gets a reminder with the project codes (change the day with
-`WEEKLY_REMINDER_DAY`, 0 = Sunday; `NO_REMINDER_JOB=1` switches the job off). A row in `email_sent` per person and week keeps it to once, across restarts.
+**Sunday at 10:00 Kuwait time**, each project manager who still owes the weekly update for the week gets a reminder with the project codes (change the day with
+`WEEKLY_REMINDER_DAY`, 0 = Sunday, and the hour with `WEEKLY_REMINDER_HOUR`; `NO_REMINDER_JOB=1` switches the job off). A row in `email_sent` per person and week keeps it to once, across restarts.
+When the assistant is switched on, the reminder also carries an **AI briefing**: two or three sentences on the
+manager's open projects and up to three actions for the week, from what is overdue, blocked or due in the next 14
+days. Only project and task names, dates and statuses go to the model, never people or emails. If the model fails,
+the plain reminder goes out instead. `AI_DIGEST=0` switches the briefing off. At the same time, the system users listed in `PMO_BRIEFING_TO`
+(comma-separated emails) get the briefing on every active project, once a week.
+
+**Daily follow-up agent.** Every working morning (Sunday to Thursday, from `FOLLOWUP_HOUR`, 9:00 Kuwait) it emails each
+milestone owner (or the project manager when the owner has no account) about their milestones that are overdue, blocked,
+due within 4 days and not started, or without an update for 7+ days and due within 14. The same milestone is asked about
+again after `FOLLOWUP_EVERY_DAYS` (2). Replies go through the email assistant (propose, then change on agreement).
+`FOLLOWUP_ENABLED=1` switches it on; `FOLLOWUP_TEST_TO=<email>` sends up to `FOLLOWUP_TEST_LIMIT` (3) of the day's
+emails to that address only, marked with who they were for. A PMO admin can preview or run it: `POST /api/followups/run`.
+When `ESCALATE_AFTER` (2) follow-ups on a milestone go unanswered (no update since), it escalates one level up the line:
+the milestone's "escalate to" person, the project manager, the department head, then the PMO (`PMO_BRIEFING_TO`, else PMO
+admins). Each escalation is recorded on the milestone (raised by the assistant) and the next level is emailed; the next
+level needs another `ESCALATE_AFTER` unanswered follow-ups. Test mode records nothing and sends previews only.
+
+**AI recommendations.** With the daily run, once a week per project (`RECOMMEND_EVERY_DAYS`, 7) and for active projects
+with late, blocked or at-risk milestones, the model proposes up to 4 changes (a realistic new deadline, a milestone given
+to someone with room, a higher priority, new project dates), each with its reason. The server keeps only what checks out
+and emails the project manager (else the department head, else the PMO), at most `RECOMMEND_PER_DAY` (5) projects a day.
+One reply approves all ("yes"), some ("1 and 3") or none ("no"); approved changes go through the API as that person.
+In test mode one project a day goes to `FOLLOWUP_TEST_TO`, and approving it changes nothing. PMO: `POST /api/recommendations/run`.
+
+**Replies by email.** With `INBOUND_ADDRESS` (the Postmark inbound address) and `INBOUND_SECRET` (16+ characters) set, every email
+carries a Reply-To on that address with a tag signed for its recipient. Postmark posts replies to
+`https://postmark:<INBOUND_SECRET>@<host>/api/inbound/postmark`; a reply whose tag matches its sender, from an active user, is
+answered by email by the portfolio assistant, from the projects that person can see. Once per message, at most 30 a day per person.
+A reply can also ask for a change: project dates, a task's progress/status/deadline/blocker/note, the weekly update, or a decision on
+a pending deadline move, change request or closure. The server writes the proposal back in its own words; nothing changes until the
+person replies YES to that email (within 24 hours, once). The change then goes through the app's own API as that person, so every
+permission and rule applies and the activity log records it. Proposals are kept in `email_actions`.
 
 ## The shape of a plan
 

@@ -7,6 +7,7 @@ import type { Permission, User } from '../shared/types';
 import { ADMIN_ROLE_ID, normalizePermissions } from '../shared/permissions';
 import { mapUser } from './mappers';
 import { projectVisibleSql } from './visibility';
+import { managesSql } from './visibility';
 
 export const SESSION_COOKIE = 'pmo_session';
 const SESSION_DAYS = 14;
@@ -17,6 +18,8 @@ declare global {
     interface Request {
       user?: User;
       perms?: Set<Permission>;
+      /** While a PMO admin views the app as someone else: the admin. req.user is then the person viewed as. */
+      realUser?: User;
     }
   }
 }
@@ -93,7 +96,7 @@ export async function requireAuth(req: Request, res: Response, next: NextFunctio
   let rows: any[];
   try {
     ({ rows } = await db.query(
-      `SELECT u.*, r.permissions AS role_permissions FROM sessions s
+      `SELECT u.*, r.permissions AS role_permissions, s.view_as_user_id FROM sessions s
          JOIN users u ON u.id = s.user_id
          JOIN roles r ON r.id = u.role_id
         WHERE s.token = $1 AND s.expires_at > SYSDATETIMEOFFSET() AND u.active = 1`,
@@ -115,8 +118,34 @@ export async function requireAuth(req: Request, res: Response, next: NextFunctio
   }
   req.user = mapUser(rows[0]);
   req.perms = new Set(normalizePermissions(rows[0].role_permissions));
+  // View as: a PMO admin sees the app exactly as the chosen person does, and nothing can be saved meanwhile.
+  const viewAs = rows[0].view_as_user_id as number | null;
+  if (viewAs && req.perms.has('projects.edit_all')) {
+    let target: any;
+    try {
+      ({ rows: [target] } = await db.query(
+        'SELECT u.*, r.permissions AS role_permissions FROM users u JOIN roles r ON r.id = u.role_id WHERE u.id = $1 AND u.active = 1',
+        [viewAs],
+      ));
+    } catch (error) {
+      next(error);
+      return;
+    }
+    if (target) {
+      req.realUser = req.user;
+      req.user = mapUser(target);
+      req.perms = new Set(normalizePermissions(target.role_permissions));
+      if (!['GET', 'HEAD', 'OPTIONS'].includes(req.method) && !VIEW_AS_ALLOWED.some((p) => req.path.endsWith(p))) {
+        res.status(423).json({ error: `Test mode: you are viewing as ${req.user.name}. Nothing is saved.`, code: 'test_mode' });
+        return;
+      }
+    }
+  }
   next();
 }
+
+/** What still works while viewing as someone: leaving that view, and signing out. */
+const VIEW_AS_ALLOWED = ['/view-as/exit', '/logout'];
 
 export function can(req: Request, perm: Permission): boolean {
   return req.perms?.has(perm) ?? false;
@@ -186,7 +215,10 @@ export async function canEditProject(req: Request, projectId: number): Promise<b
 export async function canGovernProject(req: Request, projectId: number): Promise<boolean> {
   if (can(req, 'projects.edit_all')) return true;
   if (!can(req, 'projects.edit_own')) return false;
-  return runsProject(req.user!.id, projectId);
+  if (await runsProject(req.user!.id, projectId)) return true;
+  // A program or portfolio manager watches the whole plan of the projects under them.
+  const { rows } = await db.query(`SELECT 1 FROM projects p WHERE p.id = $1 AND ${managesSql('p', '$2')}`, [projectId, req.user!.id]);
+  return rows.length > 0;
 }
 
 /**
@@ -232,3 +264,16 @@ export class HttpError extends Error {
 }
 
 export { ADMIN_ROLE_ID };
+
+/**
+ * A project's budget, resources, business case and risk plan: for those who run it (owner, department head) and
+ * those who oversee the portfolio. Team members see the rest of the project.
+ */
+export async function seesProjectInternals(req: Request, projectId: number): Promise<boolean> {
+  return can(req, 'projects.view_all') || can(req, 'projects.edit_all') || canGovernProject(req, projectId);
+}
+
+/** The project's internal fields blanked, for someone who works on it without running it. */
+export function withoutInternals<T extends { budget?: unknown }>(p: T): T {
+  return { ...p, budget: null, resources: null, businessCase: null, riskPlan: null };
+}

@@ -166,7 +166,7 @@ async function main() {
       const eff = ms.map((m) => iso(m['Effective Deadline']) ?? iso(m['Current Deadline']) ?? iso(m['Original Deadline'])).filter(Boolean) as string[];
       const status = (text(p['Overall Status']) ?? 'Not Started').toLowerCase();
       const gate = text(p['Gate']);
-      const derived: Stage = status === 'completed' ? 'closed' : gate === 'PROPOSED' ? 'initiation' : status === 'not started' ? 'planning' : 'execution';
+      const derived: Stage = status === 'completed' ? 'closure' : gate === 'PROPOSED' ? 'initiation' : status === 'not started' ? 'planning' : 'execution';
       // A workbook exported from this app carries the real stage; the tracker's own does not.
       const given = (text(p['Stage']) ?? '').toLowerCase();
       const stage: Stage = (STAGES as readonly string[]).includes(given) ? (given as Stage) : derived;

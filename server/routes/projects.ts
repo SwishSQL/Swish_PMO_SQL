@@ -2,20 +2,25 @@ import { Router } from 'express';
 import type { Request } from 'express';
 import { db } from '../db';
 import type { Queryable } from '../db';
-import { HttpError, can, canEditProject, canGovernProject, canViewProject, isMyTask, requirePermission, route, seesAllProjects, seesWholePlan } from '../auth';
+import { HttpError, can, canEditProject, seesProjectInternals, withoutInternals, canGovernProject, canViewProject, isMyTask, requirePermission, route, seesAllProjects, seesWholePlan } from '../auth';
 import { mapDependency, mapMilestoneUpdate, mapNote, mapRisk, mapTask, mapUpdate } from '../mappers';
-import { listProjects, loadDetail, logActivity, myTaskIds, nextProjectCode, restrictDetail, restrictPlan, resync, runProjectIds } from '../service';
+import { assertMilestonesDone, listProjects, loadDetail, logActivity, nextProjectCode, refreshStatus, resync, runProjectIds, setClosureMilestone } from '../service';
 import { linkPeople } from '../people';
-import { deciders, notify } from '../notify';
+import { deciders, notify, accountsNamed } from '../notify';
 import { loadCalendar } from '../calendar';
 import { projectVisibleSql, taskVisibleSql } from '../visibility';
 import { date, idParam, int, oneOf, optDate, optInt, optStr, str } from '../validate';
-import { HEALTHS, PRIORITIES, STAGES } from '../../shared/types';
+import { HEALTHS, PRIORITIES, STAGES, TEAM_ROLES } from '../../shared/types';
+import { LEADS_PROJECTS } from '../../shared/permissions';
+import type { TeamRole } from '../../shared/types';
 import type { Task } from '../../shared/types';
 import { createsCycle } from '../../shared/schedule';
 import { isBaselined, lockedError, pushSuccessors } from '../plan';
 import { addDays, diffDays, todayIso, weekStart } from '../../shared/dates';
 import { PROJECT_PHASES } from '../../shared/phases';
+import { missingForCreation } from '../../shared/stageRequirements';
+import { assertNotBlocked, releaseDependents, setDependsOn } from '../projectDeps';
+import { planScope } from '../planScope';
 
 export const projectsRouter = Router();
 
@@ -26,11 +31,12 @@ async function assertCanEdit(req: Request, projectId: number): Promise<void> {
 }
 
 /**
- * Nobody marks a project finished alone: stage Closed and health Done are set by approving a closure
- * request, or directly by those who hold that approval (the PMO admin).
+ * Nobody marks a project finished alone: health Done (with stage Closure) is set by approving a closure request,
+ * or directly by those who hold that approval (the PMO admin). Moving to the Closure stage itself is the closing
+ * work starting, which the project owner may do.
  */
 function assertMayFinish(req: Request, field: 'stage' | 'health', value: unknown, current: string | null): void {
-  const finishing = field === 'stage' ? value === 'closed' : value === 'done';
+  const finishing = field === 'health' && value === 'done';
   if (finishing && value !== current && !can(req, 'projects.approve_close')) {
     throw new HttpError(403, 'A project is closed only after a PMO admin approves it. Send a closure request from the project.');
   }
@@ -97,7 +103,7 @@ async function assertAssignable(req: Request, projectId: number, assigneeId: num
     `SELECT 1 FROM projects p JOIN users u ON u.id = $2 WHERE p.id = $1 AND u.department_id = p.department_id`,
     [projectId, assigneeId],
   );
-  if (!rows.length) throw new HttpError(400, 'Work can be given only to people of the department that owns the project.');
+  if (!rows.length) throw new HttpError(400, 'Someone of another department: ask their department head (Owner, Other departments).');
 }
 
 async function projectOfTask(taskId: number): Promise<number> {
@@ -125,16 +131,26 @@ projectsRouter.get(
   '/projects',
   route(async (req, res) => {
     const quarter = optInt(req.query.quarter, 'Quarter');
+    // Everyone sees every milestone of the projects they see; only their own open (the app locks the rest).
     const list = await listProjects(quarter, seesAllProjects(req) ? null : req.user!.id);
-    if (seesAllProjects(req)) {
+    if (can(req, 'projects.view_all') || can(req, 'projects.edit_all')) {
       res.json(list);
       return;
     }
-    // Where the person only works, the route map shows just their own milestones.
-    const [runs, mine] = await Promise.all([runProjectIds(req.user!.id), myTaskIds(req.user!.id)]);
-    res.json(list.map((p) => (runs.has(p.id) ? p : { ...p, milestones: p.milestones.filter((m) => mine.has(m.id)) })));
+    // The budget of a project shows only to those who run it.
+    const runs = await runProjectIds(req.user!.id);
+    res.json(list.map((p) => (runs.has(p.id) ? p : withoutInternals(p))));
   }),
 );
+
+/** A plan project that exists and has no live project yet. */
+async function planNotStarted(initiativeId: number): Promise<boolean> {
+  const { rows } = await db.query(
+    'SELECT 1 FROM initiatives i WHERE i.id = $1 AND NOT EXISTS (SELECT 1 FROM projects p WHERE p.initiative_id = i.id AND p.archived = 0)',
+    [initiativeId],
+  );
+  return rows.length > 0;
+}
 
 projectsRouter.post(
   '/projects',
@@ -153,20 +169,33 @@ projectsRouter.post(
       can(req, 'projects.edit_all') ||
       can(req, 'projects.assign') ||
       (can(req, 'projects.create') && dep[0].head_user_id === req.user!.id);
-    if (!mayStart) {
+    // A project manager starts a plan project nobody has started yet, in any department, and runs it.
+    const planInitiative = optInt(b.initiativeId, 'Plan project');
+    const fromPlan = !mayStart && can(req, 'projects.start_plan');
+    if (fromPlan) {
+      if (!planInitiative) throw new HttpError(403, 'A project manager starts a project from the plan: choose the plan project it delivers.');
+      if (!(await planNotStarted(planInitiative))) throw new HttpError(409, 'That plan project has already been started, or it is not on the plan.');
+    } else if (!mayStart) {
       throw new HttpError(403, 'Only the head of a department starts a project, and only in their own department. Ask the department head, or the company owner.');
     }
-    // The owner is whoever the creator names; failing that the department head, failing that the creator.
-    const managerId = optInt(b.managerId, 'Project owner') ?? dep[0].head_user_id ?? req.user!.id;
+    // The owner is whoever the creator names; failing that the department head, failing that the creator. A project
+    // manager starting a plan project runs it themselves.
+    const managerId = fromPlan ? req.user!.id : optInt(b.managerId, 'Project owner') ?? dep[0].head_user_id ?? req.user!.id;
+    // Every project has an owner, a department and a sponsor from the start.
+    if (!String(b.sponsor ?? '').trim()) throw new HttpError(400, 'Name the project sponsor.');
     const milestones: { name: string; date: string; phase?: string }[] = Array.isArray(b.milestones) ? b.milestones : [];
+    // Nothing is created half-stated: every stage's required information, and a milestone in every stage.
+    const missing = missingForCreation(b);
+    if (missing.length) throw new HttpError(400, `The project is not complete yet. Still missing: ${missing.map((m) => `${m.phase}: ${m.items.join(', ')}`).join('; ')}.`);
 
     const id = await db.tx(async (q) => {
       const code = await nextProjectCode(q);
       const { rows } = await q.query(
         `INSERT INTO projects (code, name, name_ar, description, objective, scope, department_id, manager_id,
-            sponsor, quarter_id, priority, stage, start_date, end_date, budget, created_by)
+            sponsor, quarter_id, priority, stage, start_date, end_date, budget, created_by,
+            problem_statement, stakeholders, business_case, resources, risk_plan, deliverables, success_metric, success_target, acceptance_criteria)
          OUTPUT INSERTED.id
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,'initiation',$12,$13,$14,$15)`,
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,'initiation',$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24)`,
         [
           code,
           name,
@@ -183,9 +212,19 @@ projectsRouter.post(
           endDate,
           b.budget === '' || b.budget == null ? null : Number(b.budget),
           req.user!.id,
+          ...['problemStatement', 'stakeholders', 'businessCase', 'resources', 'riskPlan', 'deliverables', 'successMetric', 'successTarget', 'acceptanceCriteria'].map((k) => optStr(b[k], k, 4000)),
         ],
       );
       const projectId: number = rows[0].id;
+      const initiativeId = planInitiative;
+      if (initiativeId) {
+        // Starting a plan project: only within this person's portfolios, programs and department; a project
+        // manager may start any one nobody has started yet (checked above).
+        const scope = fromPlan ? null : await planScope(req, q);
+        if (scope && !scope.has(initiativeId)) throw new HttpError(403, 'That plan project is outside your portfolios, programs and department: ask the PMO or its program manager.');
+        const linked = await q.query('UPDATE projects SET initiative_id = $2 WHERE id = $1 AND EXISTS (SELECT 1 FROM initiatives WHERE id = $2)', [projectId, initiativeId]);
+        if (!((linked as any).rowCount ?? (linked as any).affectedRows)) throw new HttpError(400, 'That plan project does not exist.');
+      }
       await q.query(`INSERT INTO project_members (project_id, user_id, role) VALUES ($1, $2, 'Project manager')`, [
         projectId,
         managerId,
@@ -200,7 +239,7 @@ projectsRouter.post(
       }
       // The fixed phases, in order. Those the creator ticked share the project's window one after the other; the
       // rest stay in the plan, marked Not required, on the first day.
-      const wanted = new Set<string>(Array.isArray(b.phases) ? b.phases.map(String) : PROJECT_PHASES);
+      const wanted = new Set<string>(PROJECT_PHASES);
       const chosen = PROJECT_PHASES.filter((p) => wanted.has(p));
       const span = diffDays(startDate, endDate) + 1;
       let slot = 0;
@@ -249,6 +288,12 @@ projectsRouter.post(
     if (dep[0].head_user_id && !team.some((r) => r.user_id === dep[0].head_user_id)) {
       await notify(db, [dep[0].head_user_id], { kind: 'project.assigned', projectId: id, data: { project: name, by: req.user!.name } }, req.user!.id);
     }
+    if (fromPlan) {
+      // The PMO hears that a plan project has started, and who runs it.
+      const { rows: pmo } = await db.query(`SELECT u.id FROM users u JOIN roles ro ON ro.id = u.role_id WHERE u.active = 1 AND EXISTS (SELECT 1 FROM OPENJSON(ro.permissions) WHERE value = 'projects.edit_all')`);
+      await notify(db, pmo.map((r) => r.id).filter((u) => u !== dep[0].head_user_id), { kind: 'project.plan_started', projectId: id, data: { project: name, by: req.user!.name } }, req.user!.id);
+    }
+    await tellSponsorAndStakeholders(id, null, null, b.sponsor, b.stakeholders, req.user!);
     res.status(201).json(await loadDetail(id));
   }),
 );
@@ -260,7 +305,7 @@ projectsRouter.get(
     if (!(await canViewProject(req, id))) throw new HttpError(404, 'Project not found.');
     const detail = await loadDetail(id);
     if (!detail) throw new HttpError(404, 'Project not found.');
-    res.json((await seesWholePlan(req, id)) ? detail : restrictDetail(detail, await myTaskIds(req.user!.id, id)));
+    res.json((await seesProjectInternals(req, id)) ? detail : { ...detail, project: withoutInternals(detail.project) });
   }),
 );
 
@@ -293,8 +338,15 @@ projectsRouter.patch(
         : norm(b[k]) !== norm(cur[COLUMN[k]]);
     const governed = [...new Set(Object.keys(b).filter((k) => k in GOVERNED && differs(k)).map((k) => GOVERNED[k]))];
     if (governed.length) await assertCanGovern(req, id, governed.join(', '));
-    if ('stage' in b) assertMayFinish(req, 'stage', b.stage, cur.stage);
+    // Health and stage are read from the plan, never typed. The form still sends them: an unchanged value
+    // passes. The one manual step is the PMO finishing a project (health Done) or reopening a finished one.
+    const finishing = 'health' in b && b.health !== cur.health && (b.health === 'done' || cur.health === 'done');
+    if ('stage' in b && b.stage !== cur.stage && !finishing) throw new HttpError(400, 'The stage follows the plan: it moves on as the milestones of each phase are done.');
+    if ('health' in b && b.health !== cur.health && !finishing) {
+      throw new HttpError(400, 'The health follows the plan: overdue milestones, blockers and progress against the calendar.');
+    }
     if ('health' in b) assertMayFinish(req, 'health', b.health, cur.health);
+    if (finishing && b.health === 'done') await assertMilestonesDone(db, id);
     // After the baseline, the project's dates, budget, scope and objective change only through an approved change request.
     if (await isBaselined(db, id)) {
       const text = (v: unknown) => (typeof v === 'string' ? v.trim() : '') || null;
@@ -324,6 +376,13 @@ projectsRouter.patch(
     if ('ownerName' in b) set('owner_name', optStr(b.ownerName, 'Owner', 160), 'owner');
     if ('successMetric' in b) set('success_metric', optStr(b.successMetric, 'Success metric', 2000), 'success metric');
     if ('successTarget' in b) set('success_target', optStr(b.successTarget, 'Success target', 2000), 'success target');
+    if ('problemStatement' in b) set('problem_statement', optStr(b.problemStatement, 'Problem statement', 4000), 'problem statement');
+    if ('stakeholders' in b) set('stakeholders', optStr(b.stakeholders, 'Key stakeholders', 4000), 'key stakeholders');
+    if ('businessCase' in b) set('business_case', optStr(b.businessCase, 'Business case', 4000), 'business case');
+    if ('resources' in b) set('resources', optStr(b.resources, 'Resource allocation', 4000), 'resource allocation');
+    if ('riskPlan' in b) set('risk_plan', optStr(b.riskPlan, 'Risk management strategy', 4000), 'risk management strategy');
+    if ('deliverables' in b) set('deliverables', optStr(b.deliverables, 'Key deliverables', 4000), 'key deliverables');
+    if ('acceptanceCriteria' in b) set('acceptance_criteria', optStr(b.acceptanceCriteria, 'Acceptance and sign-off', 4000), 'acceptance and sign-off');
     if ('departmentId' in b) set('department_id', int(b.departmentId, 'Department'), 'department');
     if ('managerId' in b) set('manager_id', optInt(b.managerId, 'Project manager'), 'project manager');
     if ('quarterId' in b) set('quarter_id', optInt(b.quarterId, 'Quarter'), 'quarter');
@@ -331,8 +390,12 @@ projectsRouter.patch(
     if ('stage' in b) set('stage', oneOf(b.stage, 'Stage', STAGES), 'stage');
     if ('health' in b) set('health', oneOf(b.health, 'Health', HEALTHS), 'health');
     if ('budget' in b) set('budget', b.budget === '' || b.budget == null ? null : Number(b.budget), 'budget');
-    if ('startDate' in b) set('start_date', date(b.startDate, 'Start date'), 'start date');
-    if ('endDate' in b) set('end_date', date(b.endDate, 'End date'), 'end date');
+    const startDate = 'startDate' in b ? date(b.startDate, 'Start date') : cur.start_date;
+    const endDate = 'endDate' in b ? date(b.endDate, 'End date') : cur.end_date;
+    // Checked against the date that stays as well: changing only one of them must not cross the other.
+    if (endDate < startDate) throw new HttpError(400, 'The end date is before the start date.');
+    if ('startDate' in b) set('start_date', startDate, 'start date');
+    if ('endDate' in b) set('end_date', endDate, 'end date');
     if (!sets.length) throw new HttpError(400, 'Nothing to change.');
     await db.tx(async (q) => {
       await q.query(`UPDATE projects SET ${sets.join(', ')}, updated_at = SYSDATETIMEOFFSET() WHERE id = $1`, vals);
@@ -354,7 +417,40 @@ projectsRouter.patch(
     if ('managerId' in b && Number(b.managerId) && Number(b.managerId) !== cur.manager_id) {
       await notify(db, [Number(b.managerId)], { kind: 'project.owner', projectId: id, data: { project: cur.name, by: req.user!.name } }, req.user!.id);
     }
+    // Closed by the PMO: the closure documents are taken as given. Reopened: they are owed again.
+    if ('health' in b && b.health !== cur.health && (b.health === 'done' || cur.health === 'done')) {
+      await db.tx(async (q) => {
+        await setClosureMilestone(q, id, b.health === 'done' ? 'done' : 'todo');
+        await resync(q, id);
+      });
+    }
+    if ('health' in b && b.health === 'done' && cur.health !== 'done') await releaseDependents(id, req.user!.id);
+    if ('sponsor' in b || 'stakeholders' in b) await tellSponsorAndStakeholders(id, cur.sponsor, cur.stakeholders, 'sponsor' in b ? b.sponsor : cur.sponsor, 'stakeholders' in b ? b.stakeholders : cur.stakeholders, req.user!);
+    // New dates, or a finished project reopened: the health is read from the plan again.
+    await refreshStatus(db, id);
     res.json(await loadDetail(id));
+  }),
+);
+
+/** Deleting a project for good, with everything under it. PMO admins only, with a reason that stays in the log. */
+projectsRouter.post(
+  '/projects/:id/delete',
+  requirePermission('projects.edit_all'),
+  route(async (req, res) => {
+    const id = idParam(req.params.id);
+    const reason = str(req.body?.reason, 'Reason', 1000).trim();
+    if (reason.length < 5) throw new HttpError(400, 'Give the reason for deleting the project.');
+    const { rows } = await db.query(
+      `SELECT p.code, p.name, (SELECT COUNT(*) FROM tasks t WHERE t.project_id = p.id AND t.kind = 'milestone') AS milestones FROM projects p WHERE p.id = $1`,
+      [id],
+    );
+    if (!rows[0]) throw new HttpError(404, 'Project not found.');
+    await db.tx(async (q) => {
+      // The record outlives the project: it is written without a project, so deleting it does not take it along.
+      await logActivity(q, null, req.user!.id, 'project.deleted', { code: rows[0].code, name: rows[0].name, milestones: rows[0].milestones, reason });
+      await q.query('DELETE FROM projects WHERE id = $1', [id]);
+    });
+    res.json({ ok: true });
   }),
 );
 
@@ -384,6 +480,7 @@ projectsRouter.post(
     const id = idParam(req.params.id);
     await assertCanEdit(req, id);
     const mode = oneOf(req.body?.mode ?? 'missing', 'Mode', ['missing', 'all'] as const);
+    await assertNotBlocked(id, 'approving its dates');
     if (mode === 'all') {
       if (!can(req, 'projects.edit_all')) {
         throw new HttpError(403, 'Only the PMO can re-baseline a whole project. Ask them, giving the reason.');
@@ -429,6 +526,28 @@ projectsRouter.post(
   }),
 );
 
+/** A team role from the fixed list. The project owner is the Project manager; nobody else can be. */
+function roleFor(m: { userId: number; role?: string }, owner: number | null): TeamRole {
+  if (owner !== null && Number(m.userId) === owner) return 'Project manager';
+  const role = (m.role || 'Member') as TeamRole;
+  if (!(TEAM_ROLES as readonly string[]).includes(role)) throw new HttpError(400, `Role must be one of: ${TEAM_ROLES.filter((r) => r !== 'Project manager').join(', ')}.`);
+  if (role === 'Project manager') throw new HttpError(400, 'The project manager is the project owner: change the owner in Details instead.');
+  return role;
+}
+
+/** The PMO sets which projects this one waits for. */
+projectsRouter.put(
+  '/projects/:id/depends-on',
+  requirePermission('projects.edit_all'),
+  route(async (req, res) => {
+    const id = idParam(req.params.id);
+    const ids = Array.isArray(req.body?.ids) ? req.body.ids.map((x: unknown) => int(x, 'Project')) : [];
+    await setDependsOn(id, ids, req.user!.id);
+    await logActivity(db, id, req.user!.id, 'project.depends_on', { ids });
+    res.json(await loadDetail(id));
+  }),
+);
+
 projectsRouter.put(
   '/projects/:id/members',
   route(async (req, res) => {
@@ -436,16 +555,17 @@ projectsRouter.put(
     await assertCanGovern(req, id, 'the team');
     const list: { userId: number; role: string }[] = Array.isArray(req.body?.members) ? req.body.members : [];
     const { rows: was } = await db.query('SELECT user_id FROM project_members WHERE project_id = $1', [id]);
-    // People already on the team stay; anyone new must belong to the project's department (the PMO may cross).
-    const already = new Set(was.map((r) => Number(r.user_id)));
-    for (const m of list) if (!already.has(Number(m.userId))) await assertAssignable(req, id, int(m.userId, 'Member'));
+    // Anyone may be on the team: joining gives no work. Giving work across departments goes through a request.
+    const { rows: own } = await db.query('SELECT manager_id FROM projects WHERE id = $1', [id]);
+    const owner = own[0]?.manager_id ?? null;
+    for (const m of list) roleFor(m, owner);
     await db.tx(async (q) => {
       await q.query('DELETE FROM project_members WHERE project_id = $1', [id]);
       for (const m of list) {
         await q.query(
           `INSERT INTO project_members (project_id, user_id, role) SELECT $1, $2, $3
             WHERE NOT EXISTS (SELECT 1 FROM project_members WHERE project_id = $1 AND user_id = $2)`,
-          [id, int(m.userId, 'Member'), str(m.role || 'Member', 'Role', 80)],
+          [id, int(m.userId, 'Member'), roleFor(m, owner)],
         );
       }
       await logActivity(q, id, req.user!.id, 'team.updated', { size: list.length });
@@ -510,14 +630,28 @@ projectsRouter.patch(
     const b = req.body ?? {};
     const { rows: cur } = await db.query('SELECT * FROM tasks WHERE id = $1', [taskId]);
     const task: Task = mapTask(cur[0]);
+    if (cur[0].system_key) throw new HttpError(400, 'The closure documents milestone follows the closure steps on its own: it is not edited.');
     // The owner plans and assigns. Everyone else reports on the tasks given to them, and on those alone.
     if (!(await canGovernProject(req, projectId))) {
       if (!(await isMyTask(req.user!.id, taskId))) throw new HttpError(403, 'This task is not given to you. Only the project owner changes the tasks of others.');
-      for (const k of ['assigneeId', 'parentId', 'kind', 'name', 'notRequired']) {
-        if (k in b && String(b[k] ?? '') !== String((task as any)[k] ?? '')) throw new HttpError(403, 'Only the project owner assigns work and restructures the plan.');
+      // They post updates (status, %, comment, blocker) and may ask to move a date; nothing else of the task.
+      const REPORT = new Set(['status', 'progress', 'blocker', 'updateComment', 'startDate', 'endDate', 'changeReason']);
+      for (const k of Object.keys(b)) {
+        if (REPORT.has(k)) continue;
+        if (String(b[k] ?? '') !== String((task as any)[k] ?? '')) {
+          throw new HttpError(403, 'Only the project manager changes the details of a task. Post an update, or ask to move the date.');
+        }
       }
     }
-    if ('assigneeId' in b && Number(b.assigneeId) !== task.assigneeId) await assertAssignable(req, projectId, optInt(b.assigneeId, 'Assignee'));
+    // Progress waits while a project this one depends on is still open (the plan itself can be prepared).
+    if (('status' in b && b.status !== task.status) || ('progress' in b && Number(b.progress) !== task.progress)) {
+      await assertNotBlocked(projectId, 'progress on its milestones');
+    }
+    if ('assigneeId' in b && Number(b.assigneeId) !== task.assigneeId) {
+      await assertAssignable(req, projectId, optInt(b.assigneeId, 'Assignee'));
+      // Given directly: a pending request for another owner is no longer needed.
+      await db.query(`UPDATE owner_requests SET status = 'cancelled', decided_by = $2, decided_at = SYSDATETIMEOFFSET() WHERE task_id = $1 AND status = 'pending'`, [taskId, req.user!.id]);
+    }
     const sets: string[] = [];
     const vals: unknown[] = [taskId];
     const set = (col: string, v: unknown) => {
@@ -534,7 +668,10 @@ projectsRouter.patch(
     if ('name' in b) set('name', str(b.name, 'Task name', 200));
     let start = 'startDate' in b ? date(b.startDate, 'Start date') : task.startDate;
     let end = 'endDate' in b ? date(b.endDate, 'Finish date') : task.endDate;
-    if (kind === 'milestone') end = start = 'endDate' in b && !('startDate' in b) ? end : start;
+    // A milestone is one day: a date given sets both. With no date given (ticking it done, a new %), its dates stay as
+    // they are, even an imported one whose start and deadline differ: that is not a move of its deadline. A task
+    // turned into a milestone becomes one day.
+    if (kind === 'milestone' && ('startDate' in b || 'endDate' in b || kind !== task.kind)) end = start = 'endDate' in b && !('startDate' in b) ? end : start;
     if (end < start) throw new HttpError(400, 'The finish is before the start.');
     const moved = start !== task.startDate || end !== task.endDate;
     // A milestone's deadline is a commitment: moving it needs a reason, and leaves a record the PMO can follow.
@@ -667,11 +804,16 @@ projectsRouter.patch(
       await notify(db, [Number(b.assigneeId)], { kind: 'task.assigned', projectId, taskId, data: { name: task.name, by: req.user!.name } }, req.user!.id);
     }
     if ('coOwners' in b || 'ownerName' in b) {
+      const { rows: before } = await db.query('SELECT user_id FROM task_coowners WHERE task_id = $1', [taskId]);
       await db.query('DELETE FROM task_coowners WHERE task_id = $1', [taskId]);
       await linkPeople();
+      const { rows: after } = await db.query('SELECT user_id FROM task_coowners WHERE task_id = $1', [taskId]);
+      const had = new Set(before.map((r) => r.user_id));
+      const added = after.map((r) => r.user_id).filter((u) => !had.has(u));
+      if (added.length) await notify(db, added, { kind: 'task.coowner', projectId, taskId, data: { name: task.name, by: req.user!.name } }, req.user!.id);
     }
     const plan = await planOf(projectId);
-    res.json((await seesWholePlan(req, projectId)) ? plan : restrictPlan(plan, await myTaskIds(req.user!.id, projectId)));
+    res.json(plan);
   }),
 );
 
@@ -697,9 +839,10 @@ projectsRouter.delete(
     // A phase takes everything under it, and a milestone is a commitment the
     // weekly review tracks: removing either is the manager's or the PMO's call.
     const { rows: cur } = await db.query(
-      `SELECT kind, name, code, (SELECT count(*) FROM tasks c WHERE c.parent_id = t.id) AS children FROM tasks t WHERE id = $1`,
+      `SELECT kind, name, code, system_key, (SELECT count(*) FROM tasks c WHERE c.parent_id = t.id) AS children FROM tasks t WHERE id = $1`,
       [taskId],
     );
+    if (cur[0].system_key) throw new HttpError(400, 'The closure documents milestone is part of every project and cannot be deleted.');
     if (cur[0].kind === 'milestone' || cur[0].kind === 'summary' || cur[0].children > 0) {
       await assertCanGovern(req, projectId, cur[0].kind === 'milestone' ? 'milestones (delete)' : 'phases (delete)');
     }
@@ -799,12 +942,14 @@ projectsRouter.get(
               p.name_ar AS project_name_ar, p.department_id, p.health AS project_health,
               (SELECT CAST(min(e.raised_at) AT TIME ZONE 'Arab Standard Time' AS DATE) FROM escalations e WHERE e.task_id = t.id) AS escalated_on,
               (SELECT count(*) FROM escalations e WHERE e.task_id = t.id AND e.resolved_at IS NULL) AS open_escalations,
-              (SELECT count(*) FROM deadline_changes c WHERE c.task_id = t.id AND c.status = 'pending') AS pending_changes
+              (SELECT count(*) FROM deadline_changes c WHERE c.task_id = t.id AND c.status = 'pending') AS pending_changes,
+              CASE WHEN ${taskVisibleSql('t', 'p', '$1')} THEN 1 ELSE 0 END AS openable, t.not_required,
+              CASE WHEN (t.assignee_id = $2 OR EXISTS (SELECT 1 FROM task_coowners c WHERE c.task_id = t.id AND c.user_id = $2)) THEN 1 ELSE 0 END AS mine
          FROM tasks t JOIN projects p ON p.id = t.project_id
         WHERE t.kind = 'milestone' AND p.archived = 0
-          AND ${projectVisibleSql('p', '$1')} AND ${taskVisibleSql('t', 'p', '$1')}
+          AND ${projectVisibleSql('p', '$1')}
         ORDER BY t.end_date, p.code, t.sort`,
-      [visibleTo],
+      [visibleTo, req.user!.id],
     );
     res.json(
       rows.map((r) => ({
@@ -832,6 +977,11 @@ projectsRouter.get(
         escalatedOn: r.escalated_on ?? null,
         openEscalations: r.open_escalations,
         pendingChanges: r.pending_changes,
+        // Seen by all who see the project; opened only by its owner, co-owners and those who run the project.
+        openable: Boolean(r.openable) || can(req, 'projects.edit_all'),
+        /** Given to the viewer, as owner or co-owner. */
+        mine: Boolean(r.mine),
+        notRequired: Boolean(r.not_required),
       })),
     );
   }),
@@ -867,10 +1017,11 @@ projectsRouter.get(
       db.query(
         `SELECT TOP (10) t.id, t.project_id, t.code, t.name, t.end_date, t.status, t.owner_name, p.code AS project_code
            FROM tasks t JOIN projects p ON p.id = t.project_id
-          WHERE t.kind = 'milestone' AND p.archived = 0 AND ${scope} AND ${taskVisibleSql('t', 'p', '$2')}
+          WHERE t.kind = 'milestone' AND p.archived = 0 AND ${scope}
+            AND ($3 = 1 OR t.assignee_id = $4 OR EXISTS (SELECT 1 FROM task_coowners sc_ WHERE sc_.task_id = t.id AND sc_.user_id = $4))
             AND (${FOLD('t.name')} LIKE $1 ESCAPE '\\' OR ${FOLD("COALESCE(t.code, '')")} LIKE $1 ESCAPE '\\' OR ${FOLD("COALESCE(t.owner_name, '')")} LIKE $1 ESCAPE '\\')
           ORDER BY CASE WHEN t.status IN ('done', 'cancelled') THEN 1 ELSE 0 END, t.end_date`,
-        [like, visibleTo],
+        [like, visibleTo, LEADS_PROJECTS.some((x) => can(req, x)), req.user!.id],
       ),
     ]);
     res.json({
@@ -902,6 +1053,8 @@ projectsRouter.get(
 projectsRouter.get(
   '/updates',
   route(async (req, res) => {
+    // The week's updates are for those who file them, run the meeting or oversee projects, not team members.
+    if (!LEADS_PROJECTS.some((p) => can(req, p))) throw new HttpError(403, 'The weekly stand-up is for project managers and the PMO.');
     const week = weekStart(date(req.query.week, 'Week'));
     // Same visibility as the portfolio: without view-all, only your own projects.
     const visibleTo = seesAllProjects(req) ? null : req.user!.id;
@@ -936,11 +1089,14 @@ projectsRouter.put(
     }
     // The weekly update sets the project's health, so it is the manager's (or the PMO's) report.
     if (!(await canGovernProject(req, id))) throw new HttpError(403, 'Only the project manager or the PMO files the weekly update.');
+    await assertNotBlocked(id, 'weekly updates');
     const week = weekStart(date(req.params.week, 'Week'));
     const b = req.body ?? {};
-    const health = oneOf(b.health, 'Health', HEALTHS);
-    assertMayFinish(req, 'health', health, null);
-    const progress = int(b.progress, 'Progress', 0, 100);
+    // The health and the % are the plan's own (worked out from its milestones and tasks), never typed.
+    await refreshStatus(db, id);
+    const { rows: pr } = await db.query('SELECT progress, health FROM projects WHERE id = $1', [id]);
+    const progress: number = pr[0]?.progress ?? 0;
+    const health: string = pr[0]?.health ?? 'on_track';
     const { rows } = await db.tx(async (q) => {
       const result = await q.query(
         `UPDATE status_updates WITH (UPDLOCK, HOLDLOCK) SET
@@ -964,12 +1120,6 @@ projectsRouter.put(
           req.user!.id,
         ],
       );
-      // The newest update speaks for the project's health.
-      await q.query(
-        `UPDATE projects SET health = $2, updated_at = SYSDATETIMEOFFSET()
-          WHERE id = $1 AND NOT EXISTS (SELECT 1 FROM status_updates WHERE project_id = $1 AND week_start > $3)`,
-        [id, health, week],
-      );
       await logActivity(q, id, req.user!.id, 'update.submitted', { week, health, progress });
       return result;
     });
@@ -988,7 +1138,9 @@ projectsRouter.post(
       throw new HttpError(403, 'Only people running the review or this project team can add notes.');
     }
     const { rows } = await db.query(
-      'INSERT INTO meeting_notes (update_id, kind, body, author_id) OUTPUT INSERTED.* VALUES ($1,$2,$3,$4)',
+      `INSERT INTO meeting_notes (update_id, project_id, week_start, kind, body, author_id)
+       OUTPUT INSERTED.*
+       SELECT $1, project_id, week_start, $2, $3, $4 FROM status_updates WHERE id = $1`,
       [updateId, kind, str(req.body?.body, 'Note', 2000), req.user!.id],
     );
     await logActivity(db, u[0].project_id, req.user!.id, `note.${kind}`, { body: rows[0].body });
@@ -1014,6 +1166,25 @@ projectsRouter.delete(
 
 const LEVELS = ['low', 'medium', 'high'] as const;
 
+/** A project's new sponsor and newly named key stakeholders are told. */
+async function tellSponsorAndStakeholders(projectId: number, oldSponsor: string | null, oldStake: string | null, sponsor: unknown, stake: unknown, by: { id: number; name: string }): Promise<void> {
+  const split = (s: unknown) => String(s ?? '').split(/\s*[,،\n]\s*/).filter(Boolean);
+  const { rows } = await db.query('SELECT code, name FROM projects WHERE id = $1', [projectId]);
+  const project = rows[0] ? `${rows[0].code} ${rows[0].name}` : '';
+  if (sponsor && String(sponsor).trim() !== String(oldSponsor ?? '').trim()) {
+    await notify(db, await accountsNamed(db, [String(sponsor)]), { kind: 'project.sponsor', projectId, data: { project, by: by.name } }, by.id);
+  }
+  const before = new Set(split(oldStake).map((x) => x.toLowerCase()));
+  const added = split(stake).filter((x) => !before.has(x.toLowerCase()));
+  if (added.length) await notify(db, await accountsNamed(db, added), { kind: 'project.stakeholder', projectId, data: { project, by: by.name } }, by.id);
+}
+
+/** The owner given a risk or an issue is told (not when they set it themselves). */
+async function tellRiskOwner(projectId: number, risk: { owner_id: number; title: string; kind: string }, by: { id: number; name: string }): Promise<void> {
+  const { rows } = await db.query('SELECT code, name FROM projects WHERE id = $1', [projectId]);
+  await notify(db, [risk.owner_id], { kind: 'risk.assigned', projectId, data: { name: risk.title, kind: risk.kind, project: rows[0] ? `${rows[0].code} ${rows[0].name}` : '', by: by.name } }, by.id);
+}
+
 projectsRouter.post(
   '/projects/:id/risks',
   route(async (req, res) => {
@@ -1035,6 +1206,7 @@ projectsRouter.post(
       ],
     );
     await logActivity(db, id, req.user!.id, `${rows[0].kind}.raised`, { title: rows[0].title });
+    if (rows[0].owner_id) await tellRiskOwner(id, rows[0], req.user!);
     res.status(201).json(mapRisk(rows[0]));
   }),
 );
@@ -1043,7 +1215,7 @@ projectsRouter.patch(
   '/risks/:riskId',
   route(async (req, res) => {
     const riskId = idParam(req.params.riskId);
-    const { rows: cur } = await db.query('SELECT project_id FROM risks WHERE id = $1', [riskId]);
+    const { rows: cur } = await db.query('SELECT project_id, owner_id FROM risks WHERE id = $1', [riskId]);
     if (!cur[0]) throw new HttpError(404, 'Not found.');
     await assertCanEdit(req, cur[0].project_id);
     const b = req.body ?? {};
@@ -1063,6 +1235,7 @@ projectsRouter.patch(
     if ('dueDate' in b) set('due_date', optDate(b.dueDate, 'Due date'));
     if (!sets.length) throw new HttpError(400, 'Nothing to change.');
     const { rows } = await db.query(`UPDATE risks SET ${sets.join(', ')} OUTPUT INSERTED.* WHERE id = $1`, vals);
+    if (rows[0].owner_id && rows[0].owner_id !== cur[0].owner_id) await tellRiskOwner(cur[0].project_id, rows[0], req.user!);
     res.json(mapRisk(rows[0]));
   }),
 );

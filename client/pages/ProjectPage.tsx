@@ -1,5 +1,8 @@
-import { useCallback, useEffect, useMemo, useState } from 'react';
-import { CaretRight, FileXls, PencilSimple, Plus, Trash, Archive, WarningCircle } from '@phosphor-icons/react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { TEAM_ROLES } from '../../shared/types';
+import { teamRoleLabel } from '../lib/format';
+import { AllDoneDialog, ClosureDocsPanel, openMilestonesOf } from '../components/ClosureDocs';
+import { CaretRight, FileXls, PencilSimple, Plus, Trash, Archive, WarningCircle, CalendarCheck } from '@phosphor-icons/react';
 import type {
   Health,
   Level,
@@ -7,6 +10,7 @@ import type {
   ProjectDetail,
   Risk,
   RiskKind,
+  MeetingNote,
   RiskStatus,
   Stage,
   StatusUpdate,
@@ -17,6 +21,7 @@ import { addDays, diffDays, weekStart } from '../../shared/dates';
 import { criticalPath, expectedProgress } from '../../shared/schedule';
 import { api } from '../api';
 import { navigate, useApp, useLoad, useToast } from '../lib/app';
+import { confirmLeave } from '../lib/unsaved';
 import { useT } from '../lib/i18n';
 import type { Key as TKey } from '../lib/i18n';
 import { deptName, fmtDate, fmtDateTime, fmtNumber, projectName } from '../lib/format';
@@ -25,6 +30,9 @@ import { SPRING, stagger } from '../lib/motion';
 import { Gantt } from '../components/Gantt';
 import type { PlanState } from '../components/Gantt';
 import { TaskPanel } from '../components/TaskPanel';
+import { ConfirmDone } from '../components/ConfirmDone';
+import { STAGE_FIELDS } from '../../shared/stageRequirements';
+import { DeleteProject } from '../components/DeleteProject';
 import { ReasonDialog } from '../components/ReasonDialog';
 import { UpdateDialog } from '../components/UpdateDialog';
 import { DeliveryDoc, readDeliveryFile } from '../components/DeliveryDoc';
@@ -43,10 +51,17 @@ import {
   Person,
   useLatest,
 } from '../components/ui';
+import { DateInput } from '../components/DateInput';
+import { SponsorSelect } from '../components/SponsorSelect';
+import { PeoplePicker } from '../components/PeoplePicker';
+import { DependsBar, DependsOnEditor } from '../components/ProjectDeps';
+import { MentionTextarea } from '../components/MentionTextarea';
+import { AiPmBar } from '../components/AiPm';
+import { LearnMore } from '../components/Tour';
 
 type Plan = PlanState & { project: { startDate: string; endDate: string; progress: number } };
 
-const TABS = ['plan', 'updates', 'risks', 'changes', 'team', 'details', 'activity'] as const;
+const TABS = ['plan', 'updates', 'meetings', 'risks', 'changes', 'team', 'details', 'activity'] as const;
 
 export function ProjectPage({ id, tab }: { id: number; tab: string }) {
   const { meta, dept, user, can, canEditProject, canGovernProject } = useApp();
@@ -59,6 +74,8 @@ export function ProjectPage({ id, tab }: { id: number; tab: string }) {
   const [writing, setWriting] = useState(false);
   const [rebaselining, setRebaselining] = useState(false);
   const [asking, setAsking] = useState<{ name: string; from: string; to: string; resolve: (reason: string | null) => void } | null>(null);
+  const [deleting, setDeleting] = useState(false);
+  const [confirming, setConfirming] = useState<{ name: string; reopen: boolean; askNote: boolean; resolve: (note: string | null) => void } | null>(null);
 
   const applyPlan = useCallback(
     (plan: Plan) =>
@@ -95,14 +112,24 @@ export function ProjectPage({ id, tab }: { id: number; tab: string }) {
   // Also while already on this project, when a notification points at another of its milestones.
   const loadedId = data?.project.id;
   const tasksRef = useLatest(data?.tasks);
+  const canOpenRef = useRef<((x: Task) => boolean) | null>(null);
+  // Arriving from "Needs your action" to approve the plan's dates: a banner says what to do.
+  const [guideBaseline, setGuideBaseline] = useState(() => /[?&]do=baseline/.test(window.location.hash));
+  useEffect(() => {
+    if (/[?&]do=baseline/.test(window.location.hash)) window.history.replaceState(null, '', window.location.hash.replace(/[?&]do=baseline/, ''));
+  }, []);
+  const prevOpenRef = useRef<number | null>(null);
+  const [allDone, setAllDone] = useState(false);
   useEffect(() => {
     if (!loadedId) return;
     const openFromHash = (arriving: boolean) => {
       const m = window.location.hash.match(/[?&]task=(\d+)/);
       if (!m) return;
       const taskId = Number(m[1]);
-      const mine = tasksRef.current?.some((x) => x.id === taskId);
-      if (mine) {
+      const found = tasksRef.current?.find((x) => x.id === taskId);
+      const mine = Boolean(found);
+      // Everyone sees the whole plan; a team member opens only what is theirs.
+      if (found && (canOpenRef.current?.(found) ?? true)) {
         setSelectedId(taskId);
         setPanelOpen(true);
       }
@@ -129,23 +156,46 @@ export function ProjectPage({ id, tab }: { id: number; tab: string }) {
   // Same rules as the server: the manager or the PMO decide about the project itself,
   // including its health and the weekly update that sets it.
   const canGovern = canGovernProject(project.managerId, project.departmentId);
+  // The moment the last milestone is done (in this visit), closing is next: say so, with the documents it needs.
+  const openNow = openMilestonesOf(data);
+  const closedNow = project.health === 'done' || data.closure?.status === 'pending';
+  if (prevOpenRef.current !== null && prevOpenRef.current > 0 && openNow === 0 && !closedNow && canGovern && !allDone) {
+    prevOpenRef.current = openNow;
+    queueMicrotask(() => setAllDone(true));
+  } else prevOpenRef.current = openNow;
+  canOpenRef.current = (x: Task) => canGovern || !can('projects.edit_own') || isMine(x, me) || Boolean(x.systemKey);
   // Closing is decided by a PMO admin: others ask. Same rule as the server.
   const canClose = can('projects.approve_close');
-  const canWriteUpdate = canGovern && (can('updates.write') || can('projects.edit_all'));
-  const unbaselined = tasks.filter((x) => !x.baselineEnd).length;
-  const baselineMode: 'all' | 'missing' | null = can('projects.edit_all') ? 'all' : canGovern && unbaselined > 0 ? 'missing' : null;
+  const canWriteUpdate = canGovern && (can('updates.write') || can('projects.edit_all'));
+  // Milestones and tasks waiting for approved dates (the closure documents milestone follows the plan's end).
+  const datesToApprove = tasks.filter((x) => x.kind !== 'summary' && !x.systemKey && !x.baselineEnd && x.status !== 'cancelled').length;
+  const approveDates = async () => {
+    try {
+      setData(await api.post<ProjectDetail>(`/api/projects/${id}/baseline`, { mode: 'missing' }));
+      setGuideBaseline(false);
+      toast(t('baselineSet'));
+    } catch (e) {
+      toast((e as Error).message, 'bad');
+    }
+  };
+  const baselineMode: 'all' | 'missing' | null = can('projects.edit_all') ? 'all' : canGovern && datesToApprove > 0 ? 'missing' : null;
   // Planning (adding, removing, ordering, linking) is the owner's, the department head's and the PMO's.
   // After the baseline a milestone (or a phase holding one) is removed only by a change request.
   const baselined = Boolean(project.baselineEnd);
   const holdsMilestone = (x: Task): boolean => x.kind === 'milestone' || tasks.some((c) => c.parentId === x.id && holdsMilestone(c));
-  const canDeleteTask = (x: Task) => canGovern && !(baselined && holdsMilestone(x));
+  const canDeleteTask = (x: Task) => canGovern && !x.systemKey && !(baselined && holdsMilestone(x));
   const d = dept(project.departmentId);
   const color = deptColor(d?.colorSlot);
   const today = meta.today;
   const expected = expectedProgress(project.startDate, project.endDate, today);
-  const slip = project.baselineEnd ? diffDays(project.baselineEnd, project.endDate) : null;
+  // Read from the items that have a baseline; none yet (all added since) says so rather than a stale gap.
+  const slip = project.baselineEnd ? project.baselineSlip : null;
   const thisWeek = weekStart(today);
-  const currentTab = (TABS as readonly string[]).includes(tab) ? tab : 'plan';
+  // A team member (does not run the project, does not oversee the portfolio) works from the plan, meetings, risks,
+  // team and details. The weekly report, change requests and the log are the manager's and the PMO's.
+  const memberView = !canGovern && !can('projects.view_all') && !can('projects.edit_all');
+  const tabs = memberView ? TABS.filter((k) => k !== 'updates' && k !== 'changes' && k !== 'activity') : TABS;
+  const currentTab = (tabs as readonly string[]).includes(tab) ? tab : 'plan';
 
   const patchProject = async (body: Record<string, unknown>) => {
     try {
@@ -226,6 +276,16 @@ export function ProjectPage({ id, tab }: { id: number; tab: string }) {
   const patchTask = async (taskId: number, patch: Partial<Task>) => {
     const tk = data?.tasks.find((x) => x.id === taskId);
     const body: Record<string, unknown> = { ...patch };
+    // Completing a milestone, or reopening a done one, asks first; completing can add a note.
+    const completes = tk?.kind === 'milestone' && patch.status === 'done' && tk.status !== 'done';
+    const reopens = tk?.kind === 'milestone' && tk.status === 'done' && patch.status !== undefined && patch.status !== 'done';
+    if (tk && (completes || reopens)) {
+      const given = (patch as { updateComment?: string }).updateComment;
+      const note = await new Promise<string | null>((resolve) => setConfirming({ name: tk.name, reopen: reopens, askNote: !given, resolve }));
+      setConfirming(null);
+      if (note === null) return null;
+      if (note && !given) body.updateComment = note;
+    }
     const moves = tk && tk.kind === 'milestone' && ((patch.endDate !== undefined && patch.endDate !== tk.endDate) || (patch.startDate !== undefined && patch.startDate !== tk.endDate));
     if (tk && moves) {
       const to = (patch.endDate ?? patch.startDate) as string;
@@ -290,28 +350,23 @@ export function ProjectPage({ id, tab }: { id: number; tab: string }) {
       <header className="project-head">
         <div className="project-title-row">
           <h1 className="project-title">{projectName(project, lang)}</h1>
+          <LearnMore page="project" />
           <div className="toolbar">
-            {canGovern ? (
-              <select
-                className="select"
-                aria-label={t('health')}
-                value={project.health}
-                onChange={(e) => patchProject({ health: e.target.value as Health })}
-                style={{ width: 'auto' }}
-              >
-                {HEALTHS.map((h) => (
-                  <option key={h} value={h} disabled={h === 'done' && !canClose && project.health !== 'done'}>
-                    {t(`health_${h}`)}
-                  </option>
-                ))}
-              </select>
-            ) : (
+            <span title={t('healthFromPlan')}>
               <HealthBadge health={project.health} pill />
+            </span>
+            {!memberView && (
+              <ExportButton url={`/api/projects/${id}/export.xlsx`} title={t('exportProjectHint')}>
+                <FileXls size={15} aria-hidden />
+                {t('exportExcel')}
+              </ExportButton>
             )}
-            <ExportButton url={`/api/projects/${id}/export.xlsx`} title={t('exportProjectHint')}>
-              <FileXls size={15} aria-hidden />
-              {t('exportExcel')}
-            </ExportButton>
+            {can('projects.edit_all') && (
+              <button className="btn btn-danger" onClick={() => setDeleting(true)} title={t('deleteProjectTitle')}>
+                <Trash size={15} aria-hidden />
+                {t('deleteProject')}
+              </button>
+            )}
             {canWriteUpdate && (
               <button className="btn btn-primary" onClick={() => setWriting(true)}>
                 <PencilSimple size={15} aria-hidden />
@@ -321,7 +376,10 @@ export function ProjectPage({ id, tab }: { id: number; tab: string }) {
           </div>
         </div>
 
+        <AiPmBar detail={data} canGovern={canGovern} onChanged={reload} />
+        <DependsBar detail={data} />
         <ClosureBar detail={data} canGovern={canGovern} canClose={canClose} onChanged={reload} />
+        {allDone && <AllDoneDialog canClose={canClose} onClose={() => setAllDone(false)} />}
 
         <div className="facts">
           <div className="fact">
@@ -342,8 +400,8 @@ export function ProjectPage({ id, tab }: { id: number; tab: string }) {
           </div>
           <div className="fact">
             <span>{t('baseline')}</span>
-            <span style={{ color: slip && slip > 0 ? 'var(--bad)' : undefined }}>
-              {slip === null ? t('noBaseline') : slip > 0 ? t('slipDays', { n: slip }) : slip < 0 ? t('earlyDays', { n: -slip }) : t('onBaseline')}
+            <span style={{ color: slip && slip > 0 ? 'var(--bad)' : undefined }} title={slip === null && project.baselineEnd ? t('baselinePendingHint') : undefined}>
+              {slip === null ? t(project.baselineEnd ? 'baselinePending' : 'noBaseline') : slip > 0 ? t('slipDays', { n: slip }) : slip < 0 ? t('earlyDays', { n: -slip }) : t('onBaseline')}
             </span>
           </div>
           <div className="fact" style={{ minWidth: 200 }}>
@@ -369,11 +427,10 @@ export function ProjectPage({ id, tab }: { id: number; tab: string }) {
                 role="listitem"
                 className="stage"
                 data-state={state}
-                data-editable={canGovern && (s !== 'closed' || canClose)}
-                disabled={!canGovern || (s === 'closed' && !canClose)}
-                title={s === 'closed' && !canClose ? t('closureNeedsPmo') : undefined}
+                data-editable={false}
+                disabled
+                title={`${t(`stageHint_${s}`)} ${t('stageFromPlan')}`}
                 aria-current={state === 'current' ? 'step' : undefined}
-                onClick={() => canGovern && (s !== 'closed' || canClose) && s !== project.stage && patchProject({ stage: s as Stage })}
               >
                 <i />
                 {t(`stage_${s}`)}
@@ -384,12 +441,13 @@ export function ProjectPage({ id, tab }: { id: number; tab: string }) {
       </header>
 
       <nav className="tabs" aria-label={t('project')}>
-        {TABS.map((k) => (
+        {tabs.map((k) => (
           <a key={k} className="tab" href={`#/projects/${id}/${k}`} aria-current={currentTab === k ? 'page' : undefined}>
             {currentTab === k && <motion.span layoutId="tab-ink" className="tab-ink" transition={SPRING} />}
             {t(k)}
             {k === 'plan' && <span className="count num">{tasks.length}</span>}
             {k === 'updates' && <span className="count num">{data.updates.length}</span>}
+            {k === 'meetings' && <span className="count num">{new Set(data.meetingNotes.map((n) => n.week)).size}</span>}
             {k === 'risks' && <span className="count num">{data.risks.filter((r) => r.status !== 'closed').length}</span>}
             {k === 'team' && <span className="count num">{data.members.length}</span>}
           </a>
@@ -397,6 +455,23 @@ export function ProjectPage({ id, tab }: { id: number; tab: string }) {
       </nav>
 
       <div key={currentTab} className="tab-body">
+      {currentTab === 'plan' && guideBaseline && canGovern && datesToApprove > 0 && (
+        <div className="guide-banner" role="note">
+          <CalendarCheck size={22} weight="duotone" aria-hidden />
+          <div>
+            <strong>{t('guideBaselineTitle')}</strong>
+            <p>{t('guideBaselineBody', { n: datesToApprove })}</p>
+          </div>
+          <div className="guide-actions">
+            <button className="btn btn-primary" onClick={approveDates}>
+              {t('guideBaselineApprove')}
+            </button>
+            <button className="btn btn-ghost" onClick={() => setGuideBaseline(false)}>
+              {t('guideBaselineLater')}
+            </button>
+          </div>
+        </div>
+      )}
       {currentTab === 'plan' &&
         (tasks.length === 0 ? (
           <div className="panel">
@@ -422,12 +497,21 @@ export function ProjectPage({ id, tab }: { id: number; tab: string }) {
               today={today}
               users={usersById}
               selectedId={selectedId}
-              onSelect={(tid) => {
+              onSelect={async (tid) => {
+                // Another task while an update is not posted: ask first.
+                if (panelOpen && tid !== selectedId && !(await confirmLeave())) return;
                 setSelectedId(tid);
                 if (tid === null) setPanelOpen(false);
               }}
-              onOpen={(tid) => {
+              onOpen={async (tid) => {
+                if (panelOpen && tid !== selectedId && !(await confirmLeave())) return;
                 setSelectedId(tid);
+                // Someone who works on the project but does not run it opens only the tasks given to them.
+                const picked = tasks.find((x) => x.id === tid);
+                if (picked && !picked.systemKey && !canGovern && can('projects.edit_own') && !isMine(picked, me)) {
+                  toast(t('notYourTask'), 'bad');
+                  return;
+                }
                 setPanelOpen(true);
               }}
               onMove={(tid, s, e) => patchTask(tid, { startDate: s, endDate: e })}
@@ -438,27 +522,26 @@ export function ProjectPage({ id, tab }: { id: number; tab: string }) {
               onDelete={() => selected && deleteTask(selected.id)}
               canDelete={canDeleteTask}
               baselined={baselined}
+              mine={memberView || (canGovern && tasks.some((x) => x.kind !== 'summary' && isMine(x, me))) ? (x: Task) => isMine(x, me) : undefined}
+              mineOnlyMarks={!memberView}
               baseline={
                 baselineMode === 'all'
                   ? { label: t('rebaseline'), onClick: () => setRebaselining(true) }
                   : baselineMode === 'missing'
                     ? {
-                        label: t('baselineNew', { n: unbaselined }),
-                        onClick: async () => {
-                          try {
-                            setData(await api.post<ProjectDetail>(`/api/projects/${id}/baseline`, { mode: 'missing' }));
-                            toast(t('baselineSet'));
-                          } catch (e) {
-                            toast((e as Error).message, 'bad');
-                          }
-                        },
+                        label: t('baselineNew', { n: datesToApprove }),
+                        onClick: approveDates,
+                        highlight: guideBaseline,
                       }
                     : null
               }
               editingId={editingId}
               setEditingId={setEditingId}
             />
-            {panelOpen && selected && (
+            {panelOpen && selected?.systemKey === 'closure_docs' && (
+              <ClosureDocsPanel detail={data} canGovern={canGovern} canClose={canClose} onClose={() => setPanelOpen(false)} />
+            )}
+            {panelOpen && selected && selected.systemKey !== 'closure_docs' && (
               <TaskPanel
                 task={selected}
                 tasks={tasks}
@@ -466,7 +549,7 @@ export function ProjectPage({ id, tab }: { id: number; tab: string }) {
                 users={meta.users}
                 departmentId={project.departmentId}
                 baselined={baselined}
-                canEdit={canEdit && (canGovern || selected.kind !== 'summary')}
+                canEdit={canEdit && (canGovern || (selected.kind !== 'summary' && isMine(selected, me)))}
                 isCritical={crit.critical.has(selected.id)}
                 floatDays={crit.floatDays.get(selected.id)}
                 onClose={() => setPanelOpen(false)}
@@ -487,7 +570,20 @@ export function ProjectPage({ id, tab }: { id: number; tab: string }) {
       {currentTab === 'risks' && <RisksTab projectId={id} risks={data.risks} canEdit={canEdit} onChange={reload} />}
       {currentTab === 'changes' && <ChangesTab detail={data} canAsk={canEdit} canKeep={canGovern} onApplied={reload} />}
       {currentTab === 'team' && <TeamTab detail={data} canEdit={canGovern} onSaved={setData} />}
-      {currentTab === 'details' && <DetailsTab detail={data} canEdit={canGovern} canGovern={canGovern} onSave={patchProject} />}
+      {currentTab === 'details' && memberView && <ProjectBrief detail={data} />}
+      {currentTab === 'details' && !memberView && (
+        <>
+          {can('projects.edit_all') && (
+            <div className="panel" style={{ marginBottom: 12 }}>
+              <div className="panel-body">
+                <DependsOnEditor detail={data} onSaved={reload} />
+              </div>
+            </div>
+          )}
+          <DetailsTab detail={data} canEdit={canGovern} canGovern={canGovern} onSave={patchProject} />
+        </>
+      )}
+      {currentTab === 'meetings' && <MeetingsTab detail={data} />}
       {currentTab === 'activity' && <ActivityTab detail={data} />}
       </div>
 
@@ -499,6 +595,16 @@ export function ProjectPage({ id, tab }: { id: number; tab: string }) {
           needsApproval={!canGovern}
           onConfirm={(r) => asking.resolve(r)}
           onCancel={() => asking.resolve(null)}
+        />
+      )}
+      {deleting && <DeleteProject id={project.id} name={`${project.code} ${project.name}`} onClose={() => setDeleting(false)} />}
+      {confirming && (
+        <ConfirmDone
+          name={confirming.name}
+          reopen={confirming.reopen}
+          askNote={confirming.askNote}
+          onConfirm={(note) => confirming.resolve(note)}
+          onCancel={() => confirming.resolve(null)}
         />
       )}
       {rebaselining && (
@@ -539,12 +645,19 @@ export function ProjectPage({ id, tab }: { id: number; tab: string }) {
  * Closing a project: its owner (or department head) asks, a PMO admin decides. The bar shows where the
  * request stands, and gives the right button to each side.
  */
+/** The tasks someone reports on without running the project: given to them, or shared with them as a co-owner. */
+function isMine(task: Task, me: { id: number; name: string }): boolean {
+  if (task.assigneeId === me.id) return true;
+  const name = me.name.trim().toLowerCase();
+  return (task.coOwners ?? '').split(/\s*[,،]\s*/).some((n) => n.trim().toLowerCase() === name);
+}
+
 function ClosureBar({ detail, canGovern, canClose, onChanged }: { detail: ProjectDetail; canGovern: boolean; canClose: boolean; onChanged: () => void }) {
   const { t, lang } = useT();
   const { meta } = useApp();
   const toast = useToast();
   const c = detail.closure;
-  const [asking, setAsking] = useState<'request' | 'approve' | 'reject' | null>(null);
+  const [asking, setAsking] = useState<'request' | 'approve' | 'reject' | 'close' | 'reopen' | null>(null);
   const [note, setNote] = useState('');
   // The Delivery Document that goes with a request to close: a link, a file, or both (one at least).
   const [deliveryUrl, setDeliveryUrl] = useState('');
@@ -553,13 +666,27 @@ function ClosureBar({ detail, canGovern, canClose, onChanged }: { detail: Projec
   const [reportFile, setReportFile] = useState<{ name: string; data: string } | null>(null);
   const [checklistFile, setChecklistFile] = useState<{ name: string; data: string } | null>(null);
   const [busy, setBusy] = useState(false);
-  const closed = detail.project.stage === 'closed';
+  const closed = detail.project.health === 'done';
   const pending = c?.status === 'pending';
+  // Closing waits for every milestone: the server refuses it as well.
+  const openMilestones = openMilestonesOf(detail);
+  const askRef = useLatest(() => {
+    if (closed || pending || openMilestones > 0) return;
+    if (canClose) setAsking('close');
+    else if (canGovern) setAsking('request');
+  });
+  useEffect(() => {
+    const on = () => askRef.current();
+    window.addEventListener('pmo:closure-ask', on);
+    return () => window.removeEventListener('pmo:closure-ask', on);
+  }, [askRef]);
   const send = async () => {
-    if (!asking || (!c && asking !== 'request')) return;
+    if (!asking || (!c && (asking === 'approve' || asking === 'reject'))) return;
     setBusy(true);
     try {
-      if (asking === 'request') await api.post(`/api/projects/${detail.project.id}/closure-request`, { note, deliveryUrl, deliveryFile, reportFile, checklistFile });
+      // The PMO closes directly (no request to itself), or reopens a closed project: its health is read from the plan again.
+      if (asking === 'close' || asking === 'request') await api.post(`/api/projects/${detail.project.id}/closure-request`, { note, deliveryUrl, deliveryFile, reportFile, checklistFile });
+      else if (asking === 'reopen') await api.patch(`/api/projects/${detail.project.id}`, { health: 'on_track' });
       else await api.post(`/api/closure-requests/${c!.id}/decide`, { decision: asking, note });
       setAsking(null);
       setNote('');
@@ -575,10 +702,19 @@ function ClosureBar({ detail, canGovern, canClose, onChanged }: { detail: Projec
       setBusy(false);
     }
   };
-  const canAsk = canGovern && !canClose && !closed && !pending;
+  // Both closure documents picked: sent at once, no extra click.
+  const sendRef = useLatest(send);
+  useEffect(() => {
+    if ((asking === 'request' || asking === 'close') && reportFile && checklistFile && !busy) void sendRef.current();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [reportFile, checklistFile]);
+  const canAsk = canGovern && !canClose && !closed && !pending && openMilestones === 0;
   const showRejected = !pending && !closed && c?.status === 'rejected';
   const showApproved = closed && c?.status === 'approved';
-  if (!pending && !canAsk && !showRejected && !showApproved) return null;
+  const canFinish = canClose && !closed && !pending && openMilestones === 0;
+  const canReopen = canClose && closed;
+  const waiting = canGovern && !closed && !pending && openMilestones > 0;
+  if (!waiting && !pending && !canAsk && !showRejected && !showApproved && !canFinish && !canReopen) return null;
   return (
     <>
       <div className={`closure-bar ${pending ? 'pending' : ''}`} role="status">
@@ -586,7 +722,10 @@ function ClosureBar({ detail, canGovern, canClose, onChanged }: { detail: Projec
           {pending && c && t('closurePending', { by: c.requestedByName ?? '', date: fmtDateTime(c.createdAt, lang) })}
           {showRejected && c && t('closureRejected', { date: c.decidedAt ? fmtDateTime(c.decidedAt, lang) : '' })}
           {showApproved && c && t('closureApproved', { by: c.decidedByName ?? '', date: c.decidedAt ? fmtDateTime(c.decidedAt, lang) : '' })}
+          {waiting && t('closureWaitMilestones', { n: openMilestones })}
           {!c && canAsk && t('closureHint')}
+          {canFinish && !showRejected && t('closureDirectHint')}
+          {canReopen && !showApproved && t('closureClosed')}
           {c?.note && pending && <em> {'⁨'}{c.note}{'⁩'}</em>}
           {c?.decisionNote && !pending && <em> {'⁨'}{c.decisionNote}{'⁩'}</em>}
           {c && (pending || showApproved) && (c.deliveryUrl || c.deliveryFileName || c.reportFileName) && (
@@ -601,7 +740,17 @@ function ClosureBar({ detail, canGovern, canClose, onChanged }: { detail: Projec
             {t('closureRequest')}
           </button>
         )}
-        {pending && canClose && c && c.requestedBy !== meta.me.id && (
+        {canFinish && (
+          <button className="btn btn-sm btn-primary" onClick={() => setAsking('close')}>
+            {t('closureCloseNow')}
+          </button>
+        )}
+        {canReopen && (
+          <button className="btn btn-sm" onClick={() => setAsking('reopen')}>
+            {t('closureReopen')}
+          </button>
+        )}
+        {pending && canClose && c && c.requestedBy !== meta.me.id && openMilestones === 0 && (
           <>
             <button className="btn btn-sm btn-primary" onClick={() => setAsking('approve')}>
               {t('closureApprove')}
@@ -614,7 +763,7 @@ function ClosureBar({ detail, canGovern, canClose, onChanged }: { detail: Projec
       </div>
       {asking && (
         <Dialog
-          title={asking === 'request' ? t('closureRequestTitle') : asking === 'approve' ? t('closureApprove') : t('closureReject')}
+          title={asking === 'request' ? t('closureRequestTitle') : asking === 'approve' ? t('closureApprove') : asking === 'close' ? t('closureCloseNow') : asking === 'reopen' ? t('closureReopen') : t('closureReject')}
           onClose={() => setAsking(null)}
           width={520}
           footer={
@@ -622,44 +771,19 @@ function ClosureBar({ detail, canGovern, canClose, onChanged }: { detail: Projec
               <button className="btn" onClick={() => setAsking(null)}>
                 {t('cancel')}
               </button>
-              <button className="btn btn-primary" disabled={busy || (asking === 'request' && (!reportFile || !checklistFile))} onClick={send}>
-                {asking === 'request' ? t('closureSend') : t('save')}
+              <button className="btn btn-primary" disabled={busy || ((asking === 'request' || asking === 'close') && (!reportFile || !checklistFile))} onClick={send}>
+                {asking === 'request' ? t('closureSend') : asking === 'close' ? t('closureCloseNow') : asking === 'reopen' ? t('closureReopen') : t('save')}
               </button>
             </>
           }
         >
-          <Field label={asking === 'request' ? t('closureNote') : t('closureDecisionNote')} hint={asking === 'request' ? t('closureRequestHint') : undefined}>
-            <textarea className="input" rows={4} value={note} onChange={(e) => setNote(e.target.value)} />
-          </Field>
-          {asking === 'request' && (
+          {(asking === 'close' || asking === 'reopen') && <p>{t(asking === 'close' ? 'closureCloseConfirm' : 'closureReopenConfirm', { name: detail.project.name })}</p>}
+          {asking !== 'close' && asking !== 'reopen' && <Field label={asking === 'request' ? t('closureNote') : t('closureDecisionNote')} hint={asking === 'request' ? t('closureRequestHint') : undefined}>
+            <MentionTextarea className="input" rows={4} value={note} onChange={(e) => setNote(e.target.value)} />
+          </Field>}
+          {(asking === 'request' || asking === 'close') && (
             <div className="form-grid" style={{ marginTop: 14 }}>
-              {(
-                [
-                  ['closureReport', 'closure-report', reportFile, setReportFile],
-                  ['closureChecklist', 'sign-off-checklist', checklistFile, setChecklistFile],
-                ] as const
-              ).map(([label, template, value, setValue]) => (
-                <Field key={template} label={`${t(label)} *`} hint={value ? value.name : t('closureDocsHint')} className="span-2">
-                  <div style={{ display: 'flex', gap: 10, alignItems: 'center', flexWrap: 'wrap' }}>
-                    <input
-                      className="input"
-                      style={{ flex: 1, minWidth: 200 }}
-                      type="file"
-                      accept=".pdf,.doc,.docx"
-                      onChange={async (e) => {
-                        const f = e.target.files?.[0];
-                        if (!f) return setValue(null);
-                        const r = await readDeliveryFile(f, (why) => toast(t(why === 'big' ? 'deliveryTooBig' : 'deliveryReadFailed'), 'bad'));
-                        if (!r) e.target.value = '';
-                        setValue(r);
-                      }}
-                    />
-                    <a className="btn btn-ghost btn-sm" href={`/api/templates/${template}`} download>
-                      {t('closureTemplate')}
-                    </a>
-                  </div>
-                </Field>
-              ))}
+              <p className="muted span-2" style={{ margin: 0, fontSize: 12.5 }}>{t('closureAutoHint')}</p>
               <Field label={t('deliveryOptional')} hint={t('deliveryDocHint')} className="span-2">
                 <input className="input" type="url" placeholder="https://..." dir="ltr" value={deliveryUrl} onChange={(e) => setDeliveryUrl(e.target.value)} />
               </Field>
@@ -677,6 +801,33 @@ function ClosureBar({ detail, canGovern, canClose, onChanged }: { detail: Projec
                   }}
                 />
               </Field>
+              {(
+                [
+                  ['closureReport', 'closure-report', reportFile, setReportFile],
+                  ['closureChecklist', 'sign-off-checklist', checklistFile, setChecklistFile],
+                ] as const
+              ).map(([label, template, value, setValue]) => (
+                <Field key={template} label={`${t(label)} *`} hint={value ? value.name : t('closureDocsHint')} className="span-2">
+                  <div style={{ display: 'flex', gap: 10, alignItems: 'center', flexWrap: 'wrap' }}>
+                    <input
+                      className="input"
+                      style={{ flex: 1, minWidth: 200 }}
+                      type="file"
+                      accept=".pdf,.doc,.docx,.xls,.xlsx,.ppt,.pptx,.csv,.txt,.png,.jpg,.jpeg,.zip"
+                      onChange={async (e) => {
+                        const f = e.target.files?.[0];
+                        if (!f) return setValue(null);
+                        const r = await readDeliveryFile(f, (why) => toast(t(why === 'big' ? 'deliveryTooBig' : 'deliveryReadFailed'), 'bad'));
+                        if (!r) e.target.value = '';
+                        setValue(r);
+                      }}
+                    />
+                    <a className="btn btn-ghost btn-sm" href={`/api/templates/${template}`} download>
+                      {t('closureTemplate')}
+                    </a>
+                  </div>
+                </Field>
+              ))}
             </div>
           )}
         </Dialog>
@@ -730,7 +881,10 @@ function UpdatesTab({ updates, canEdit, onWrite, thisWeek }: { updates: StatusUp
               {u.notes.map((n) => (
                 <div key={n.id} className="note">
                   <span className={`note-kind k-${n.kind}`}>{t(n.kind)}</span>
-                  <span>{n.body}</span>
+                  <span>
+                    {n.body}
+                    <NoteStamp n={n} />
+                  </span>
                 </div>
               ))}
             </div>
@@ -923,10 +1077,10 @@ function RisksTab({ projectId, risks, canEdit, onChange }: { projectId: number; 
               </select>
             </Field>
             <Field label={t('dueDate')}>
-              <input className="input" type="date" value={editing.dueDate ?? ''} onChange={(e) => setEditing({ ...editing, dueDate: e.target.value || null })} />
+              <DateInput className="input" value={editing.dueDate ?? ''} onChange={(e) => setEditing({ ...editing, dueDate: e.target.value || null })} />
             </Field>
             <Field label={t('mitigation')} className="span-2">
-              <textarea className="textarea" value={editing.mitigation ?? ''} onChange={(e) => setEditing({ ...editing, mitigation: e.target.value })} />
+              <MentionTextarea className="textarea" value={editing.mitigation ?? ''} onChange={(e) => setEditing({ ...editing, mitigation: e.target.value })} />
             </Field>
           </div>
         </Dialog>
@@ -938,13 +1092,13 @@ function RisksTab({ projectId, risks, canEdit, onChange }: { projectId: number; 
 // ---- Team -------------------------------------------------------------------
 
 function TeamTab({ detail, canEdit, onSaved }: { detail: ProjectDetail; canEdit: boolean; onSaved: (d: ProjectDetail) => void }) {
-  const { t } = useT();
+  const { t, lang } = useT();
   const { meta, user, can } = useApp();
   const toast = useToast();
   const [members, setMembers] = useState(detail.members);
   const [adding, setAdding] = useState<number | ''>('');
   const dirty = JSON.stringify(members) !== JSON.stringify(detail.members);
-  const taskCount = (uid: number) => detail.tasks.filter((x) => x.assigneeId === uid && x.kind !== 'summary').length;
+  const taskCount = (uid: number) => detail.tasks.filter((x) => x.assigneeId === uid && x.kind !== 'summary' && x.status !== 'cancelled').length;
 
   const save = async () => {
     try {
@@ -974,19 +1128,33 @@ function TeamTab({ detail, canEdit, onSaved }: { detail: ProjectDetail; canEdit:
                   <Person user={user(m.userId)} size="lg" />
                 </td>
                 <td>
-                  {canEdit ? (
-                    <input
-                      className="input"
+                  {canEdit && m.userId !== detail.project.managerId ? (
+                    <select
+                      className="select"
                       style={{ maxWidth: 240 }}
-                      value={m.role}
+                      value={(TEAM_ROLES as readonly string[]).includes(m.role) && m.role !== 'Project manager' ? m.role : 'Member'}
                       aria-label={t('role')}
                       onChange={(e) => setMembers(members.map((x, j) => (j === i ? { ...x, role: e.target.value } : x)))}
-                    />
+                    >
+                      {TEAM_ROLES.filter((r) => r !== 'Project manager').map((r) => (
+                        <option key={r} value={r}>
+                          {teamRoleLabel(r, lang)}
+                        </option>
+                      ))}
+                    </select>
                   ) : (
-                    m.role
+                    teamRoleLabel(m.userId === detail.project.managerId ? 'Project manager' : m.role, lang)
                   )}
                 </td>
-                <td className="num ink-2">{taskCount(m.userId)}</td>
+                <td className="num ink-2">
+                  {taskCount(m.userId)}
+                  {/* Nothing given to them: a plain Member does not see the project until they have work in it. */}
+                  {taskCount(m.userId) === 0 && m.userId !== detail.project.managerId && (
+                    <span className={m.role === 'Member' ? 'team-note is-warn' : 'team-note'}>
+                      {m.role === 'Member' ? t('teamNoWorkHidden') : t('teamNoWork')}
+                    </span>
+                  )}
+                </td>
                 <td style={{ textAlign: 'end' }}>
                   {canEdit && m.userId !== detail.project.managerId && (
                     <button className="btn btn-ghost btn-sm" onClick={() => setMembers(members.filter((_, j) => j !== i))}>
@@ -1003,13 +1171,30 @@ function TeamTab({ detail, canEdit, onSaved }: { detail: ProjectDetail; canEdit:
         <div className="panel-body" style={{ display: 'flex', gap: 8, flexWrap: 'wrap', borderTop: '1px solid var(--line)' }}>
           <select className="select" style={{ maxWidth: 280 }} value={adding} aria-label={t('addMember')} onChange={(e) => setAdding(e.target.value ? Number(e.target.value) : '')}>
             <option value="">{t('addMember')}</option>
-            {meta.users
-              .filter((u) => u.active && !members.some((m) => m.userId === u.id) && (can('projects.edit_all') || u.departmentId === detail.project.departmentId))
-              .map((u) => (
-                <option key={u.id} value={u.id}>
-                  {u.name}
-                </option>
-              ))}
+            {(() => {
+              const free = meta.users.filter((u) => u.active && !members.some((m) => m.userId === u.id));
+              const own = free.filter((u) => u.departmentId === detail.project.departmentId);
+              const rest = free.filter((u) => u.departmentId !== detail.project.departmentId);
+              return (
+                <>
+                  <optgroup label={own.length ? t('op_yourDept') : `${t('op_yourDept')} · ${t('tm_noneLeft')}`}>
+                    {own.map((u) => (
+                      <option key={u.id} value={u.id}>
+                        {u.name}
+                      </option>
+                    ))}
+                  </optgroup>
+                  <optgroup label={t('tm_otherDepts')}>
+                    {rest.map((u) => (
+                      <option key={u.id} value={u.id}>
+                        {u.name}
+                        {u.departmentId ? ` · ${meta.departments.find((d) => d.id === u.departmentId)?.name ?? ''}` : ''}
+                      </option>
+                    ))}
+                  </optgroup>
+                </>
+              );
+            })()}
           </select>
           <button
             className="btn"
@@ -1021,6 +1206,7 @@ function TeamTab({ detail, canEdit, onSaved }: { detail: ProjectDetail; canEdit:
           >
             {t('add')}
           </button>
+          <span className="hint" style={{ alignSelf: 'center' }}>{t('tm_crossHint')}</span>
           <button className="btn btn-primary" style={{ marginInlineStart: 'auto' }} disabled={!dirty} onClick={save}>
             {t('save')}
           </button>
@@ -1055,6 +1241,13 @@ function DetailsTab({
     ownerName: p.managerName ?? '',
     successMetric: p.successMetric ?? '',
     successTarget: p.successTarget ?? '',
+    problemStatement: p.problemStatement ?? '',
+    stakeholders: p.stakeholders ?? '',
+    businessCase: p.businessCase ?? '',
+    resources: p.resources ?? '',
+    riskPlan: p.riskPlan ?? '',
+    deliverables: p.deliverables ?? '',
+    acceptanceCriteria: p.acceptanceCriteria ?? '',
     priority: p.priority,
     quarterId: p.quarterId ?? '',
     objective: p.objective ?? '',
@@ -1098,7 +1291,7 @@ function DetailsTab({
             </select>
           </Field>
           <Field label={t('sponsor')}>
-            <input className="input" disabled={ro} value={form.sponsor} onChange={(e) => set('sponsor', e.target.value)} />
+            <SponsorSelect disabled={ro} value={form.sponsor ?? ''} onChange={(v) => set('sponsor', v)} />
           </Field>
           <Field label={t('priority')}>
             <select className="select" disabled={roGov} value={form.priority} onChange={(e) => set('priority', e.target.value as Priority)}>
@@ -1140,6 +1333,18 @@ function DetailsTab({
           <Field label={t('scope')} className="span-2" hint={locked ? t('cr_lockedField') : undefined}>
             <textarea className="textarea" disabled={ro || locked} value={form.scope} onChange={(e) => set('scope', e.target.value)} />
           </Field>
+          {(['problemStatement', 'stakeholders', 'businessCase', 'resources', 'riskPlan', 'deliverables', 'acceptanceCriteria'] as const).map((k) => {
+            const f = Object.values(STAGE_FIELDS).flat().find((x) => x.key === k)!;
+            return (
+              <Field key={k} label={lang === 'ar' ? f.ar : f.en} className="span-2">
+                {k === 'stakeholders' ? (
+                  <PeoplePicker label={lang === 'ar' ? f.ar : f.en} disabled={ro} value={form[k]} onChange={(v) => set(k, v)} />
+                ) : (
+                  <textarea className="textarea" dir="auto" disabled={ro} value={form[k]} onChange={(e) => set(k, e.target.value)} />
+                )}
+              </Field>
+            );
+          })}
           <Field label={t('description')} className="span-2">
             <textarea className="textarea" disabled={ro} value={form.description} onChange={(e) => set('description', e.target.value)} />
           </Field>
@@ -1227,7 +1432,7 @@ function RebaselineDialog({
           {t('rebaselineBody', { n: slipped })}
         </p>
         <Field label={t('rebaselineReason')} hint={t('rebaselineHint')}>
-          <textarea className="textarea" value={reason} onChange={(e) => setReason(e.target.value)} />
+          <MentionTextarea className="textarea" value={reason} onChange={(e) => setReason(e.target.value)} />
         </Field>
       </div>
     </Dialog>
@@ -1235,6 +1440,55 @@ function RebaselineDialog({
 }
 
 // ---- Activity ---------------------------------------------------------------
+
+/** Who wrote a note and when, to the minute. */
+export function NoteStamp({ n }: { n: MeetingNote }) {
+  const { lang } = useT();
+  const { user } = useApp();
+  const who = n.authorName ?? (n.authorId ? user(n.authorId)?.name : null);
+  return (
+    <span className="note-stamp">
+      {[who, fmtDateTime(n.createdAt, lang)].filter(Boolean).join(' · ')}
+    </span>
+  );
+}
+
+/** What the weekly meetings decided about this project, week by week, newest first. */
+function MeetingsTab({ detail }: { detail: ProjectDetail }) {
+  const { t, lang } = useT();
+  const weeks = new Map<string, MeetingNote[]>();
+  for (const n of detail.meetingNotes) {
+    const w = n.week ?? n.createdAt.slice(0, 10);
+    weeks.set(w, [...(weeks.get(w) ?? []), n]);
+  }
+  const order = [...weeks.keys()].sort().reverse();
+  if (!order.length) return <div className="panel"><p className="muted" style={{ margin: 0 }}>{t('noMeetingNotes')}</p></div>;
+  const extra = (n: MeetingNote) =>
+    [
+      n.ownerName && (n.kind === 'decision_needed' ? t('decidesBy', { n: n.ownerName }) : n.ownerName),
+      n.dueDate && t('dueOn', { d: fmtDate(n.dueDate, lang, true) }),
+      n.doneAt && `${t(n.kind === 'blocker' ? 'clearedOn' : 'closedOn', { d: fmtDateTime(n.doneAt, lang) })}`,
+    ].filter(Boolean).join(' · ');
+  return (
+    <div className="panel">
+      {order.map((w, i) => (
+        <article key={w} className="update-card enter" style={stagger(i)}>
+          <strong>{t('meetingOfWeek', { d: fmtDate(w, lang, true) })}</strong>
+          {weeks.get(w)!.map((n) => (
+            <div key={n.id} className="note">
+              <span className={`note-kind k-${n.kind}`}>{t(n.kind)}</span>
+              <span style={{ textDecoration: n.doneAt && n.kind === 'action' ? 'line-through' : undefined }}>
+                {n.body}
+                {extra(n) && <span className="muted" style={{ display: 'block', fontSize: 12 }}>{extra(n)}</span>}
+                <NoteStamp n={n} />
+              </span>
+            </div>
+          ))}
+        </article>
+      ))}
+    </div>
+  );
+}
 
 function ActivityTab({ detail }: { detail: ProjectDetail }) {
   const { t, lang } = useT();
@@ -1252,6 +1506,13 @@ function ActivityTab({ detail }: { detail: ProjectDetail }) {
         const rest = (d.fields ?? []).filter((f: string) => !(d.healthFrom && f === 'health') && !(d.stageFrom && f === 'stage'));
         if (rest.length) parts.push((lang === 'ar' ? 'عدّل ' : 'changed ') + rest.join(', '));
         return parts.join('. ');
+      }
+      case 'project.status_auto': {
+        // Set by the system from the plan, not by a person.
+        const parts: string[] = [];
+        if (d.healthFrom) parts.push(`${t('health')}: ${t(`health_${d.healthFrom}` as TKey)} → ${t(`health_${d.health}` as TKey)}`);
+        if (d.stageFrom) parts.push(`${t('stage')}: ${t(`stage_${d.stageFrom}` as TKey)} → ${t(`stage_${d.stage}` as TKey)}`);
+        return `${parts.join('. ')} (${t('fromThePlan')})`;
       }
       case 'task.created':
         return (lang === 'ar' ? 'أضاف ' : 'added ') + `"${d.name}"`;
@@ -1297,6 +1558,62 @@ function ActivityTab({ detail }: { detail: ProjectDetail }) {
           ))}
         </ul>
       )}
+    </div>
+  );
+}
+
+/** What a team member needs to know about the project they work on: its purpose and what success looks like. */
+function ProjectBrief({ detail }: { detail: ProjectDetail }) {
+  const { t, lang } = useT();
+  const { dept } = useApp();
+  const p = detail.project;
+  const label = (key: string) => {
+    for (const fields of Object.values(STAGE_FIELDS)) {
+      const f = fields.find((x) => x.key === key);
+      if (f) return lang === 'ar' ? f.ar : f.en;
+    }
+    return key;
+  };
+  const rows: [string, string | null][] = [
+    [label('objective'), p.objective],
+    [label('problemStatement'), p.problemStatement],
+    [label('scope'), p.scope],
+    [label('deliverables'), p.deliverables],
+    [label('successMetric'), p.successMetric],
+    [label('successTarget'), p.successTarget],
+    [label('acceptanceCriteria'), p.acceptanceCriteria],
+    [label('stakeholders'), p.stakeholders],
+  ];
+  return (
+    <div className="panel brief">
+      <div className="brief-facts">
+        <div>
+          <span>{t('manager')}</span>
+          <strong>{p.managerName ?? '-'}</strong>
+        </div>
+        <div>
+          <span>{t('sponsor')}</span>
+          <strong>{p.sponsor || '-'}</strong>
+        </div>
+        <div>
+          <span>{t('department')}</span>
+          <strong>{deptName(dept(p.departmentId), lang)}</strong>
+        </div>
+        <div>
+          <span>{t('priority')}</span>
+          <strong>{t(`priority_${p.priority}`)}</strong>
+        </div>
+      </div>
+      <dl className="brief-list">
+        {rows
+          .filter(([, v]) => v && v.trim())
+          .map(([k, v]) => (
+            <div key={k}>
+              <dt>{k}</dt>
+              <dd>{v}</dd>
+            </div>
+          ))}
+      </dl>
     </div>
   );
 }

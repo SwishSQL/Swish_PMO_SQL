@@ -1,4 +1,5 @@
 import type { Queryable } from './db';
+import { HttpError } from './auth';
 import { db } from './db';
 import { projectVisibleSql } from './visibility';
 import {
@@ -12,8 +13,10 @@ import {
   mapUpdate,
 } from './mappers';
 import type { ProjectDetail, ProjectSummary, Task } from '../shared/types';
-import { projectProgress, rollUp } from '../shared/schedule';
+import { projectProgress, rollUp, criticalPath } from '../shared/schedule';
+import { deriveHealth, deriveStage } from '../shared/autoStatus';
 import { todayIso } from '../shared/dates';
+import { blockedByMap, dependsOn } from './projectDeps';
 
 export async function logActivity(
   q: Queryable,
@@ -45,7 +48,13 @@ const SUMMARY_SQL = `
         AND t.status NOT IN ('done','cancelled')
         ORDER BY CASE WHEN t.update_comment_on IS NULL THEN 1 ELSE 0 END, t.update_comment_on DESC, t.end_date) AS last_comment,
     (SELECT max(u.week_start) FROM status_updates u WHERE u.project_id = p.id) AS last_update_week,
-    (SELECT count(*) FROM risks r WHERE r.project_id = p.id AND r.status <> 'closed') AS open_risks
+    (SELECT count(*) FROM risks r WHERE r.project_id = p.id AND r.status <> 'closed') AS open_risks,
+    -- The committed finish and the slip against it, read from the items that have a baseline: an item added or
+    -- re-dated by an approved change brings its own baseline, which the first baseline of the project never saw.
+    (SELECT CONVERT(CHAR(10), max(t.baseline_end), 23) FROM tasks t
+      WHERE t.project_id = p.id AND t.baseline_end IS NOT NULL AND t.status <> 'cancelled' AND t.system_key IS NULL) AS plan_baseline_end,
+    (SELECT DATEDIFF(DAY, max(t.baseline_end), max(t.end_date)) FROM tasks t
+      WHERE t.project_id = p.id AND t.baseline_end IS NOT NULL AND t.status <> 'cancelled' AND t.system_key IS NULL) AS plan_slip
   FROM projects p
   LEFT JOIN users mu ON mu.id = p.manager_id
 `;
@@ -72,16 +81,17 @@ export async function listProjects(quarterId: number | null, visibleTo: number |
               SELECT 1 FROM quarters q
                WHERE q.id = $1 AND p.start_date <= q.ends_on
                  AND (p.end_date >= q.starts_on
-                      OR (q.starts_on <= CAST($3 AS DATE) AND p.stage <> 'closed' AND p.health <> 'done' AND p.progress < 100))))
+                      OR (q.starts_on <= CAST($3 AS DATE) AND p.health <> 'done' AND p.progress < 100))))
         AND ${projectVisibleSql('p', '$2')}
       ORDER BY p.code`,
     [quarterId, visibleTo, todayIso()],
   );
+  const blocks = await blockedByMap();
   return rows.map((r) => {
     const p = mapProject({ ...r, milestones: normaliseMilestones(r.milestones) });
     const { description, objective, scope, baselineStart, createdAt, updatedAt, ...summary } = p;
     void description, objective, scope, baselineStart, createdAt, updatedAt;
-    return summary;
+    return { ...summary, blockedBy: blocks.get(p.id) ?? [] };
   });
 }
 
@@ -95,8 +105,12 @@ export async function loadDetail(projectId: number): Promise<ProjectDetail | nul
     db.query('SELECT * FROM task_dependencies WHERE project_id = $1', [projectId]),
     db.query('SELECT * FROM status_updates WHERE project_id = $1 ORDER BY week_start DESC', [projectId]),
     db.query(
-      `SELECT n.* FROM meeting_notes n JOIN status_updates u ON u.id = n.update_id
-        WHERE u.project_id = $1 ORDER BY n.created_at`,
+      `SELECT n.id, n.update_id, n.kind, n.body, n.author_id, n.created_at, n.owner_id, n.due_date, n.done_at,
+              COALESCE(n.project_id, u.project_id) AS project_id, COALESCE(n.week_start, u.week_start) AS week_start,
+              a.name AS author_name, o.name AS owner_name
+         FROM meeting_notes n LEFT JOIN status_updates u ON u.id = n.update_id
+         LEFT JOIN users a ON a.id = n.author_id LEFT JOIN users o ON o.id = n.owner_id
+        WHERE COALESCE(n.project_id, u.project_id) = $1 ORDER BY n.created_at`,
       [projectId],
     ),
     db.query(
@@ -112,8 +126,10 @@ export async function loadDetail(projectId: number): Promise<ProjectDetail | nul
       [projectId],
     ),
   ]);
+  const allNotes = notes.rows.map(mapNote);
   const notesByUpdate = new Map<number, ReturnType<typeof mapNote>[]>();
-  for (const n of notes.rows.map(mapNote)) {
+  for (const n of allNotes) {
+    if (n.updateId === null) continue;
     const l = notesByUpdate.get(n.updateId);
     if (l) l.push(n);
     else notesByUpdate.set(n.updateId, [n]);
@@ -126,7 +142,9 @@ export async function loadDetail(projectId: number): Promise<ProjectDetail | nul
     updates: updates.rows.map((u) => mapUpdate(u, notesByUpdate.get(u.id) ?? [])),
     risks: risks.rows.map(mapRisk),
     activity: activity.rows.map(mapActivity),
+    meetingNotes: allNotes,
     closure: closure.rows[0] ? mapClosure(closure.rows[0]) : null,
+    dependsOn: await dependsOn(projectId),
   };
 }
 
@@ -134,10 +152,89 @@ export async function loadDetail(projectId: number): Promise<ProjectDetail | nul
  * Re-derives everything computed from the plan: summary rows, the project's
  * window and its progress. Call inside the same transaction as the edit.
  */
+export const CLOSURE_DOCS = 'closure_docs';
+const CLOSURE_DOCS_NAME = 'Closure documents: closure report and signed sign-off checklist';
+const CLOSURE_DOCS_NOTE = [
+  'The documents that prove the project is done, attached when asking to close it (Close project, on the project page):',
+  '1. Project Closure Report: overview, objectives, KPI results against their targets, scope, delivered outcomes, issues and lessons learned, handover, and the closure declaration signed by the executive sponsor and the project lead.',
+  '2. Project Sign-Off Checklist, signed: A KPI achievement, B project outcome integrity, C validation and acceptance, D documentation and governance, E user readiness and training, F controls and compliance, G transition and support, H closure formalities.',
+  'Both templates can be downloaded here and on the closure panel. This milestone is completed when the PMO approves the closure.',
+].join('\n');
+
+/**
+ * Every plan ends with the closure documents: a milestone the system adds and keeps on the last date of the plan,
+ * given to the project manager. It is done once the project is closed (the PMO approved the closure, with both
+ * documents attached), and it never holds up the request to close.
+ */
+export async function ensureClosureMilestone(q: Queryable, projectId: number): Promise<void> {
+  const { rows: pr } = await q.query('SELECT manager_id, health, baseline_end FROM projects WHERE id = $1', [projectId]);
+  if (!pr[0]) return;
+  const { rows: plan } = await q.query(
+    `SELECT CONVERT(CHAR(10), max(end_date), 23) AS [last], count(*) AS n
+       FROM tasks WHERE project_id = $1 AND system_key IS NULL AND kind <> 'summary' AND status <> 'cancelled' AND not_required = 0`,
+    [projectId],
+  );
+  // A project with nothing planned yet gets it with its first milestone.
+  if (!plan[0].n || !plan[0].last) return;
+  const due: string = plan[0].last;
+  const closed = pr[0].health === 'done';
+  const { rows: cur } = await q.query(
+    `SELECT id, status, CONVERT(CHAR(10), end_date, 23) AS d FROM tasks WHERE project_id = $1 AND system_key = $2`,
+    [projectId, CLOSURE_DOCS],
+  );
+  if (!cur[0]) {
+    // At the end of the plan, on its own: inside a phase it would stretch that phase to the last date.
+    const { rows: top } = await q.query('SELECT COALESCE(max(sort), 0) AS sort FROM tasks WHERE project_id = $1', [projectId]);
+    // In a baselined plan it is baselined on its date, so adding it is not counted as a slip.
+    const base = pr[0].baseline_end ? due : null;
+    await q.query(
+      `INSERT INTO tasks (project_id, parent_id, kind, name, start_date, end_date, baseline_start, baseline_end, assignee_id, sort, notes, status, progress, system_key)
+       VALUES ($1, $2, 'milestone', $3, $4, $4, $5, $5, $6, $7, $8, $9, $10, $11)`,
+      [projectId, null, CLOSURE_DOCS_NAME, due, base, pr[0].manager_id ?? null, top[0].sort + 10, CLOSURE_DOCS_NOTE, closed ? 'done' : 'todo', closed ? 100 : 0, CLOSURE_DOCS],
+    );
+    return;
+  }
+  const c = cur[0];
+  if (closed && c.status !== 'done') {
+    await q.query(`UPDATE tasks SET status = 'done', progress = 100 WHERE id = $1`, [c.id]);
+  } else if (!closed && c.status !== 'done' && c.status !== 'cancelled' && c.d !== due) {
+    // It stays the last step: it moves with the end of the plan, and so does its baseline.
+    await q.query(
+      `UPDATE tasks SET start_date = $2, end_date = $2,
+              baseline_start = CASE WHEN baseline_end IS NULL THEN NULL ELSE CAST($2 AS DATE) END,
+              baseline_end = CASE WHEN baseline_end IS NULL THEN NULL ELSE CAST($2 AS DATE) END
+        WHERE id = $1`,
+      [c.id, due],
+    );
+  }
+}
+
+/** The closure documents milestone, set by the closure steps (asked, approved or closed, rejected or reopened). */
+export async function setClosureMilestone(q: Queryable, projectId: number, status: 'todo' | 'in_progress' | 'done'): Promise<void> {
+  await q.query('UPDATE tasks SET status = $3, progress = $4 WHERE project_id = $1 AND system_key = $2', [
+    projectId,
+    CLOSURE_DOCS,
+    status,
+    status === 'done' ? 100 : status === 'in_progress' ? 50 : 0,
+  ]);
+}
+
+/** Once, at start: every project with a plan and no closure documents milestone gets it (and its figures again). */
+export async function addClosureMilestones(): Promise<void> {
+  const { rows } = await db.query(
+    `SELECT p.id FROM projects p
+      WHERE EXISTS (SELECT 1 FROM tasks t WHERE t.project_id = p.id AND t.kind <> 'summary')
+        AND NOT EXISTS (SELECT 1 FROM tasks t WHERE t.project_id = p.id AND t.system_key = 'closure_docs')`,
+  );
+  for (const r of rows) await db.tx((q) => resync(q, r.id));
+  if (rows.length) console.log(`[plan] closure documents milestone added to ${rows.length} projects`);
+}
+
 export async function resync(q: Queryable, projectId: number): Promise<void> {
+  await ensureClosureMilestone(q, projectId);
   const { rows } = await q.query('SELECT * FROM tasks WHERE project_id = $1', [projectId]);
   const tasks: Task[] = rows.map(mapTask);
-  if (tasks.length === 0) return;
+  if (tasks.length === 0) return refreshStatus(q, projectId);
   const rolled = rollUp(tasks);
   const before = new Map(tasks.map((t) => [t.id, t]));
   for (const t of rolled) {
@@ -162,6 +259,41 @@ export async function resync(q: Queryable, projectId: number): Promise<void> {
     'UPDATE projects SET start_date = $2, end_date = $3, progress = $4, updated_at = SYSDATETIMEOFFSET() WHERE id = $1',
     [projectId, start, end, projectProgress(rolled)],
   );
+  await refreshStatus(q, projectId);
+}
+
+/**
+ * The project's health and stage, read again from its plan (shared/autoStatus.ts): never typed by anyone.
+ * Each change is written to the activity log.
+ */
+export async function refreshStatus(q: Queryable, projectId: number): Promise<void> {
+  const { rows: pr } = await q.query(
+    `SELECT health, stage, progress, CONVERT(CHAR(10), start_date, 23) AS [start], CONVERT(CHAR(10), end_date, 23) AS [end],
+            (SELECT count(*) FROM meeting_notes n WHERE n.project_id = p.id AND n.kind = 'blocker' AND n.done_at IS NULL) AS blockers
+       FROM projects p WHERE id = $1`,
+    [projectId],
+  );
+  const p = pr[0];
+  if (!p) return;
+  const { rows } = await q.query('SELECT * FROM tasks WHERE project_id = $1', [projectId]);
+  const { rows: deps } = await q.query('SELECT * FROM task_dependencies WHERE project_id = $1', [projectId]);
+  const tasks = rows.map(mapTask);
+  const critical = criticalPath(tasks, deps.map(mapDependency)).critical;
+  const input = { tasks, critical, start: p.start, end: p.end, progress: p.progress, health: p.health, stage: p.stage, projectBlockers: p.blockers, today: todayIso() };
+  const health = deriveHealth(input);
+  const stage = deriveStage(input);
+  if (health === p.health && stage === p.stage) return;
+  await q.query('UPDATE projects SET health = $2, stage = $3, updated_at = SYSDATETIMEOFFSET() WHERE id = $1', [projectId, health, stage]);
+  await logActivity(q, projectId, null, 'project.status_auto', {
+    ...(health !== p.health ? { health, healthFrom: p.health } : {}),
+    ...(stage !== p.stage ? { stage, stageFrom: p.stage } : {}),
+  });
+}
+
+/** Every open project, read again: a deadline passing overnight changes the health with no edit at all. */
+export async function refreshAllStatuses(): Promise<void> {
+  const { rows } = await db.query("SELECT id FROM projects WHERE archived = 0 AND health <> 'done'");
+  for (const r of rows) await refreshStatus(db, r.id);
 }
 
 export async function nextProjectCode(q: Queryable): Promise<string> {
@@ -218,4 +350,15 @@ export function restrictDetail(detail: ProjectDetail, mine: Set<number>): Projec
     ...cut,
     project: { ...detail.project, milestones: detail.project.milestones.filter((m) => mine.has(m.id)) },
   };
+}
+
+/** A project closes only once every milestone is done (or cancelled, or marked not required). */
+export async function assertMilestonesDone(q: Queryable, projectId: number): Promise<void> {
+  const { rows } = await q.query(
+    `SELECT count(*) AS n FROM tasks WHERE project_id = $1 AND kind = 'milestone' AND not_required = 0 AND status NOT IN ('done', 'cancelled')
+        AND (system_key IS NULL OR system_key <> 'closure_docs')`,
+    [projectId],
+  );
+  const n = rows[0]?.n ?? 0;
+  if (n > 0) throw new HttpError(400, `Finish the project's milestones first: ${n} still open.`);
 }

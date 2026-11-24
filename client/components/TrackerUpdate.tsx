@@ -48,9 +48,13 @@ export function TrackerUpdateButton({ onDone }: { onDone: () => void }) {
         r.onerror = () => reject(new Error(t('deliveryReadFailed')));
         r.readAsDataURL(f);
       });
-      setPlan(await api.post<Plan>('/api/tracker/preview', { data }));
+      // Applied at once: the popup shows what it changed.
+      const done = await api.post<Plan>('/api/tracker/apply', { name: f.name, data });
+      setPlan(done);
       setFile({ name: f.name, data });
       setOpen(new Set());
+      toast(t('trkDone', { u: done.updated.reduce((n, p) => n + p.changes.length, 0), c: done.created.length }));
+      onDone();
     } catch (e) {
       toast((e as Error).message, 'bad');
     } finally {
@@ -60,20 +64,6 @@ export function TrackerUpdateButton({ onDone }: { onDone: () => void }) {
   const close = () => {
     setPlan(null);
     setFile(null);
-  };
-  const apply = async () => {
-    if (!file) return;
-    setBusy(true);
-    try {
-      const done = await api.post<Plan>('/api/tracker/apply', file);
-      toast(t('trkDone', { u: done.updated.reduce((n, p) => n + p.changes.length, 0), c: done.created.length }));
-      close();
-      onDone();
-    } catch (e) {
-      toast((e as Error).message, 'bad');
-    } finally {
-      setBusy(false);
-    }
   };
   const toggle = (k: string) => setOpen((s) => (s.has(k) ? new Set([...s].filter((x) => x !== k)) : new Set([...s, k])));
   const nothing = plan && plan.updated.length === 0 && plan.created.length === 0 && plan.filled.length === 0;
@@ -97,16 +87,13 @@ export function TrackerUpdateButton({ onDone }: { onDone: () => void }) {
       />
       {plan && (
         <Dialog
-          title={t('trkTitle')}
+          title={t('trkAppliedTitle')}
           onClose={close}
           width={860}
           footer={
             <>
-              <button className="btn" onClick={close}>
-                {t('cancel')}
-              </button>
-              <button className="btn btn-primary" disabled={busy || !!nothing} onClick={apply}>
-                {t('trkApply')}
+              <button className="btn btn-primary" onClick={close}>
+                {t('close')}
               </button>
             </>
           }

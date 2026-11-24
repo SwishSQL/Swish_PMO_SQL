@@ -1,7 +1,10 @@
+import crypto from 'crypto';
 import { Router } from 'express';
 import type { Request } from 'express';
 import { db } from '../db';
-import { HttpError, canManageAccounts, isOwner, issueInvite, requireAccountManager, route } from '../auth';
+import { HttpError, SESSION_COOKIE, canManageAccounts, isOwner, issueInvite, requireAccountManager, requirePermission, route } from '../auth';
+import { runFollowups } from '../followup';
+import { runRecommendations } from '../recommend';
 import { mapDepartment, mapQuarter, mapRole, mapTask, mapUser } from '../mappers';
 import { date, idParam, optInt, optStr, str } from '../validate';
 import type { Meta } from '../../shared/types';
@@ -17,9 +20,36 @@ import { logActivity } from '../service';
 import { directory, linkPeople, mergeName } from '../people';
 import { buildBackup } from '../backup';
 import { loadHolidays } from '../calendar';
-import { mailDiagnostics, mailEnabled, sendMail } from '../mail';
+import { appBase, mailDiagnostics, mailEnabled, sendMail, setupEmail, testEmail } from '../mail';
+import { syncStaffFromAccount } from '../orgSync';
+import { notify } from '../notify';
 
 export const metaRouter = Router();
+
+/** A PMO admin views the app as another person: read-only, to test what they see and can do. */
+metaRouter.post(
+  '/view-as',
+  requirePermission('projects.edit_all'),
+  route(async (req, res) => {
+    const userId = optInt(req.body?.userId, 'Person');
+    if (!userId) throw new HttpError(400, 'Choose the person to view as.');
+    if (userId === req.user!.id) throw new HttpError(400, 'Choose someone other than yourself.');
+    const { rows } = await db.query('SELECT id, name FROM users WHERE id = $1 AND active = 1', [userId]);
+    if (!rows[0]) throw new HttpError(404, 'That account is not active.');
+    await db.query('UPDATE sessions SET view_as_user_id = $2 WHERE token = $1', [req.cookies?.[SESSION_COOKIE], userId]);
+    await logActivity(db, null, req.user!.id, 'viewas.started', { name: rows[0].name });
+    res.json({ ok: true });
+  }),
+);
+
+metaRouter.post(
+  '/view-as/exit',
+  route(async (req, res) => {
+    await db.query('UPDATE sessions SET view_as_user_id = NULL WHERE token = $1', [req.cookies?.[SESSION_COOKIE]]);
+    if (req.realUser) await logActivity(db, null, req.realUser.id, 'viewas.ended', { name: req.user!.name });
+    res.json({ ok: true });
+  }),
+);
 
 metaRouter.get(
   '/meta',
@@ -41,6 +71,8 @@ metaRouter.get(
     );
     const meta: Meta = {
       me: req.user!,
+      viewingAs: req.realUser ? { by: req.realUser.name } : null,
+      session: crypto.createHash('sha256').update(String(req.cookies?.[SESSION_COOKIE] ?? '')).digest('hex').slice(0, 16),
       myPassword: {
         setAt: sec[0]?.password_set_at ? new Date(sec[0].password_set_at).toISOString() : null,
         viaLinkFrom: sec[0]?.link_by ?? null,
@@ -48,6 +80,7 @@ metaRouter.get(
       permissions: [...(req.perms ?? [])],
       isOwner: isOwner(req.user!.email),
       canManageUsers: canManageAccounts(req),
+      managesPlan: (await db.query('SELECT TOP (1) x.n FROM (SELECT 1 AS n FROM capabilities WHERE manager_user_id = $1 UNION ALL SELECT 1 FROM dimensions WHERE manager_user_id = $1) x', [req.user!.id])).rows.length > 0,
       mustChangePassword: Boolean(sec[0]?.temp_password),
       emailSignIn: mailEnabled(),
       roles: roles.rows.map(mapRole),
@@ -135,6 +168,41 @@ async function linkHeadIfFree(user: { id: number; role_id: string; department_id
   return rows[0]?.name ?? null;
 }
 
+/**
+ * Sends a setup link to the person's own mailbox. The answer says whether it went: on success the link is not
+ * given back (it reaches the person only); with no mail set up at all, the admin gets it to pass on by hand.
+ */
+async function deliverSetupLink(
+  req: Request,
+  user: { id: number; name: string; email: string },
+  invite: { token: string; expires: Date },
+  reset: boolean,
+): Promise<{ emailed: boolean; mailError?: string; inviteToken?: string }> {
+  if (!mailEnabled()) return { emailed: false, inviteToken: invite.token };
+  const base = appBase() || `${req.protocol}://${req.get('host')}`;
+  const mail = setupEmail({ name: user.name, email: user.email, url: `${base}/#/activate/${invite.token}`, expires: invite.expires, reset, by: req.user!.name });
+  try {
+    await sendMail(user.email, mail.subject, mail.text, mail.html);
+    await db.query('UPDATE users SET setup_emailed_at = SYSDATETIMEOFFSET() WHERE id = $1', [user.id]);
+    await logActivity(db, null, req.user!.id, 'user.setup_emailed', { email: user.email, reset });
+    return { emailed: true };
+  } catch (e) {
+    console.error('[mail] setup link to', user.email, 'failed:', (e as Error).message);
+    return { emailed: false, mailError: (e as Error).message };
+  }
+}
+
+/** The guided tour was finished or skipped: it no longer opens by itself. */
+metaRouter.post(
+  '/me/tour-done',
+  route(async (req, res) => {
+    const page = typeof req.body?.page === 'string' && /^[a-z]{2,20}$/.test(req.body.page) ? req.body.page : null;
+    if (page) await db.query(`UPDATE users SET tours_seen = JSON_MODIFY(tours_seen, 'append $', $2) WHERE id = $1 AND NOT EXISTS (SELECT 1 FROM OPENJSON(tours_seen) WHERE value = $2)`, [req.user!.id, page]);
+    else await db.query('UPDATE users SET tour_done_at = COALESCE(tour_done_at, SYSDATETIMEOFFSET()) WHERE id = $1', [req.user!.id]);
+    res.json({ ok: true });
+  }),
+);
+
 metaRouter.post(
   '/users',
   manage,
@@ -159,12 +227,41 @@ metaRouter.post(
       const invite = await issueInvite(q, rows[0].id, req.user!.id);
       return { user: { ...rows[0], invite_expires_at: invite.expires }, inviteToken: invite.token };
     });
-    await logActivity(db, null, req.user!.id, 'user.created', { email, roleId, systemAdmin });
+    // Before launch the setup email can wait: sent later from the Users page, one by one or to everyone at once.
+    const hold = req.body?.sendEmail === false;
+    await logActivity(db, null, req.user!.id, 'user.created', { email, roleId, systemAdmin, held: hold });
     const linkedHeadOf = await linkHeadIfFree(user, req.body?.makeHead === true);
     if (linkedHeadOf) await logActivity(db, null, req.user!.id, 'department.head_linked', { email, department: linkedHeadOf });
     await linkPeople();
-    // The token goes back once, to the admin who sends the link. Only its hash is stored.
-    res.status(201).json({ ...mapUser(user), inviteToken, linkedHeadOf });
+    // The link goes to the person by email; only its hash is stored.
+    if (hold) {
+      res.status(201).json({ ...mapUser(user), emailed: false, held: true, linkedHeadOf });
+      return;
+    }
+    const sent = await deliverSetupLink(req, user, { token: inviteToken, expires: user.invite_expires_at }, false);
+    res.status(201).json({ ...mapUser(user), ...sent, linkedHeadOf });
+  }),
+);
+
+/** Every account whose setup email has not gone out yet (held before launch): a fresh link to each, by email. */
+metaRouter.post(
+  '/users/send-setup-emails',
+  manage,
+  route(async (req, res) => {
+    if (!mailEnabled()) throw new HttpError(400, 'Email is not set up on the server, so nothing can be sent.');
+    const { rows } = await db.query(
+      `SELECT * FROM users WHERE active = 1 AND must_set_password = 1 AND setup_emailed_at IS NULL ORDER BY name`,
+    );
+    let sent = 0;
+    const failed: string[] = [];
+    for (const u of rows) {
+      const invite = await issueInvite(db, u.id, req.user!.id);
+      const r = await deliverSetupLink(req, u, invite, false);
+      if (r.emailed) sent += 1;
+      else failed.push(u.name);
+    }
+    await logActivity(db, null, req.user!.id, 'user.setup_emailed_all', { sent, failed: failed.length });
+    res.json({ sent, failed });
   }),
 );
 
@@ -188,7 +285,8 @@ metaRouter.post(
     }
     const invite = await issueInvite(db, id, req.user!.id);
     await logActivity(db, null, req.user!.id, 'user.invite_link', { email: cur.email });
-    res.json({ ...mapUser({ ...cur, invite_expires_at: invite.expires }), inviteToken: invite.token });
+    const sent = await deliverSetupLink(req, cur, invite, false);
+    res.json({ ...mapUser({ ...cur, invite_expires_at: invite.expires }), ...sent });
   }),
 );
 
@@ -209,7 +307,23 @@ metaRouter.patch(
       sets.push(`${col} = $${vals.length}`);
     };
     if ('name' in b) set('name', str(b.name, 'Name', 120));
+    // A new sign-in email: a company address nobody else uses. The owner's address is what makes them the owner.
+    let emailFrom: string | null = null;
+    if ('email' in b) {
+      const email = str(b.email, 'Email', 200).toLowerCase();
+      if (email !== String(cur.email).toLowerCase()) {
+        if (owner) throw new HttpError(400, "The owner's email cannot be changed.");
+        if (!isCompanyEmail(email)) throw new HttpError(400, `Use a ${COMPANY_DOMAIN} company email.`);
+        const taken = await db.query('SELECT 1 FROM users WHERE LOWER(email) = $1 AND id <> $2', [email, id]);
+        if (taken.rows.length) throw new HttpError(409, 'Someone already uses that email.');
+        if (isOwner(email)) throw new HttpError(400, "That is the owner's email.");
+        set('email', email);
+        emailFrom = cur.email;
+      }
+    }
     if ('title' in b) set('title', optStr(b.title, 'Title', 120));
+    if ('aiPaused' in b) set('ai_paused', b.aiPaused === true);
+    if ('awayUntil' in b) set('away_until', b.awayUntil ? date(b.awayUntil, 'Away until') : null);
     if ('departmentId' in b) set('department_id', optInt(b.departmentId, 'Department'));
     const nextAdmin: boolean = 'systemAdmin' in b ? b.systemAdmin === true : Boolean(cur.is_system_admin);
     if ('systemAdmin' in b && nextAdmin !== Boolean(cur.is_system_admin)) {
@@ -234,7 +348,9 @@ metaRouter.patch(
     if (!sets.length) throw new HttpError(400, 'Nothing to change.');
     const { rows } = await db.query(`UPDATE users SET ${sets.join(', ')} OUTPUT INSERTED.* WHERE id = $1`, vals);
     if (!nextActive) await db.query('DELETE FROM sessions WHERE user_id = $1', [id]);
-    await logActivity(db, null, req.user!.id, 'user.updated', { email: cur.email, fields: Object.keys(b) });
+    await logActivity(db, null, req.user!.id, 'user.updated', { email: rows[0].email, fields: Object.keys(b), ...(emailFrom ? { emailFrom, emailTo: rows[0].email } : {}) });
+    // The org chart keeps the same name, department and position.
+    if ('name' in b || 'departmentId' in b || 'title' in b || emailFrom) await syncStaffFromAccount(db, id, emailFrom);
     if ('name' in b || nextActive) await linkPeople();
     const linkedHeadOf = 'roleId' in b || 'departmentId' in b || b.makeHead === true ? await linkHeadIfFree(rows[0], b.makeHead === true) : null;
     if (linkedHeadOf) await logActivity(db, null, req.user!.id, 'department.head_linked', { email: cur.email, department: linkedHeadOf });
@@ -318,10 +434,8 @@ metaRouter.post(
       return issueInvite(q, id, req.user!.id);
     });
     await logActivity(db, null, req.user!.id, 'user.password_reset', { email: cur.email });
-    res.json({
-      ...mapUser({ ...cur, password_hash: null, must_set_password: true, invite_expires_at: invite.expires }),
-      inviteToken: invite.token,
-    });
+    const sent = await deliverSetupLink(req, cur, invite, true);
+    res.json({ ...mapUser({ ...cur, password_hash: null, must_set_password: true, invite_expires_at: invite.expires }), ...sent });
   }),
 );
 
@@ -335,12 +449,8 @@ metaRouter.post(
   route(async (req, res) => {
     if (!mailEnabled()) throw new HttpError(503, 'Mail is not set up: SMTP_HOST, SMTP_USER and SMTP_PASS are missing on the server.');
     try {
-      await sendMail(
-        req.user!.email,
-        'SWiSH PMO: test email',
-        'This is a test from SWiSH PMO. If you can read it, the system can email people their first password.',
-        '<p>This is a test from <b>SWiSH PMO</b>. If you can read it, the system can email people their first password.</p>',
-      );
+      const mail = testEmail();
+      await sendMail(req.user!.email, mail.subject, mail.text, mail.html);
     } catch (e) {
       // What the mail server said (never the password: the library does not echo it).
       const err = e as Error & { code?: string; responseCode?: number };
@@ -353,6 +463,30 @@ metaRouter.post(
 // ---- Backup -----------------------------------------------------------------
 // The whole database as one .sql file, for a copy that lives outside the server.
 // Same people as account management: it holds every record in the system.
+
+/**
+ * The daily follow-up agent, by hand: { dryRun: true } only shows who would be asked about how many milestones;
+ * otherwise it sends now (to the test address in test mode). The PMO only.
+ */
+metaRouter.post(
+  '/followups/run',
+  requirePermission('projects.edit_all'),
+  route(async (req, res) => {
+    // The tests move the day forward to see reminders and escalations build up; nobody else can.
+    const today = process.env.ALLOW_TEST_CLOCK === '1' && typeof req.body?.today === 'string' ? date(req.body.today, 'Day') : undefined;
+    res.json(await runFollowups({ force: true, dryRun: req.body?.dryRun === true, today }));
+  }),
+);
+
+/** The weekly AI recommendations, by hand: { dryRun: true } shows what would be recommended, without sending. The PMO only. */
+metaRouter.post(
+  '/recommendations/run',
+  requirePermission('projects.edit_all'),
+  route(async (req, res) => {
+    const today = process.env.ALLOW_TEST_CLOCK === '1' && typeof req.body?.today === 'string' ? date(req.body.today, 'Day') : undefined;
+    res.json(await runRecommendations({ force: true, dryRun: req.body?.dryRun === true, today }));
+  }),
+);
 
 metaRouter.get(
   '/backup',
@@ -550,6 +684,9 @@ metaRouter.patch(
       to: { name: rows[0].name, nameAr: rows[0].name_ar, head: rows[0].head_name },
       ...(cur[0].head_user_id !== rows[0].head_user_id ? { headAccountFrom: cur[0].head_user_id, headAccountTo: rows[0].head_user_id } : {}),
     });
+    if (rows[0].head_user_id && rows[0].head_user_id !== cur[0].head_user_id) {
+      await notify(db, [rows[0].head_user_id], { kind: 'department.head', data: { name: rows[0].name, by: req.user!.name } }, req.user!.id);
+    }
     res.json(mapDepartment(rows[0]));
   }),
 );

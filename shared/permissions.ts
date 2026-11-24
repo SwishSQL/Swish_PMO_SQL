@@ -5,6 +5,7 @@ export const PERMISSIONS = [
   { key: 'projects.view_all', group: 'projects' },
   { key: 'projects.create', group: 'projects' },
   { key: 'projects.assign', group: 'projects' },
+  { key: 'projects.start_plan', group: 'projects' },
   { key: 'projects.edit_own', group: 'projects' },
   { key: 'projects.edit_all', group: 'projects' },
   { key: 'projects.archive', group: 'projects' },
@@ -20,6 +21,9 @@ export const PERMISSIONS = [
 
 export type Permission = (typeof PERMISSIONS)[number]['key'];
 export const PERMISSION_KEYS: Permission[] = PERMISSIONS.map((p) => p.key);
+
+/** Those who file updates, run the meeting or oversee projects: the Weekly Stand-up and the Dashboard are theirs. A team member reports through their milestones instead. */
+export const LEADS_PROJECTS: Permission[] = ['updates.write', 'meeting.run', 'projects.view_all', 'projects.edit_all'];
 
 export const ADMIN_ROLE_ID = 'admin';
 export const COMPANY_DOMAIN = '@swishhh.net';
@@ -55,7 +59,9 @@ export const DEFAULT_ROLES: { id: string; name: string; nameAr: string; permissi
     id: 'pm',
     name: 'Project manager',
     nameAr: 'مدير مشروع',
-    permissions: ['projects.view_all', 'projects.edit_own', 'updates.write', 'report.view'],
+    // Their own projects only (those they run or work on): the whole portfolio is for the PMO and executives.
+    // They start a project from a plan project nobody has started yet, and run it.
+    permissions: ['projects.edit_own', 'projects.start_plan', 'updates.write', 'report.view'],
   },
   { id: 'member', name: 'Team member', nameAr: 'عضو فريق', permissions: ['projects.edit_own'] },
 ];

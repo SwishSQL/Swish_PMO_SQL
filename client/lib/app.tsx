@@ -1,6 +1,7 @@
 import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from 'react';
 import type { ReactNode } from 'react';
 import type { Department, Meta, Permission, User } from '../../shared/types';
+import { confirmLeave, hasUnsaved } from './unsaved';
 
 // ---- Hash router ------------------------------------------------------------
 // '#/projects/12/plan' -> ['projects', '12', 'plan']. A hash keeps deep links
@@ -13,7 +14,20 @@ function readHash(): string[] {
 export function useRoute(): string[] {
   const [route, setRoute] = useState(readHash);
   useEffect(() => {
-    const on = () => setRoute(readHash());
+    let passing = false;
+    const on = async (e: HashChangeEvent) => {
+      if (passing || !hasUnsaved()) {
+        passing = false;
+        setRoute(readHash());
+        return;
+      }
+      // Back to where it was while the person decides; on with the move only if they let it go.
+      const to = window.location.hash;
+      window.history.replaceState(null, '', e.oldURL);
+      if (!(await confirmLeave())) return;
+      passing = true;
+      window.location.hash = to;
+    };
     window.addEventListener('hashchange', on);
     return () => window.removeEventListener('hashchange', on);
   }, []);

@@ -1,19 +1,26 @@
 import { useMemo, useState } from 'react';
+import { LEADS_PROJECTS } from '../../shared/permissions';
+import { ALL_DATES, DateRange, inRange, overlaps } from '../components/DateRange';
+import type { Range } from '../components/DateRange';
 import { Buildings, FileXls, MagnifyingGlass, Rows, Warning } from '@phosphor-icons/react';
 import type { MilestoneRow } from '../../shared/types';
 import { addDays, diffDays } from '../../shared/dates';
 import { api } from '../api';
-import { navigate, useApp, useLoad } from '../lib/app';
+import { navigate, useApp, useLoad, safeGet, safeSet } from '../lib/app';
 import { useT } from '../lib/i18n';
 import { fmtDate, projectName, relativeDays } from '../lib/format';
 import { CountUp, stagger } from '../lib/motion';
 import { milestoneFlags } from '../../shared/health';
+import { MsLegend, MsPill, milestoneTone } from '../lib/milestoneTone';
 import { deptColor, Empty, ErrorState, ExportButton, NameAvatar, PageSkeleton, Segmented } from '../components/ui';
+import { LearnMore } from '../components/Tour';
 
 type StatusFilter = 'overdue' | 'week' | 'stale' | 'warning' | 'open' | 'done' | 'all' | 'lateesc' | 'approval';
 type TileFilter = Exclude<StatusFilter, 'lateesc' | 'approval'>;
 const FILTERS: TileFilter[] = ['overdue', 'week', 'stale', 'warning', 'open', 'done', 'all'];
 const PAGE = 60;
+
+const NO_OWNER = '__none';
 
 function hashParam(name: string): string | null {
   const m = window.location.hash.match(new RegExp(`[?&]${name}=([^&]+)`));
@@ -26,15 +33,26 @@ function hashParam(name: string): string | null {
  * tracker's Departments page did.
  */
 export function Milestones() {
-  const { meta, dept } = useApp();
+  const { meta, dept, can } = useApp();
   const { t, lang } = useT();
   const today = meta.today;
-  const { data, error, reload } = useLoad(() => api.get<MilestoneRow[]>('/api/milestones'), [], 'milestones');
+  const { data: all, error, reload } = useLoad(() => api.get<MilestoneRow[]>('/api/milestones'), [], 'milestones');
+  // A team member's page is their own milestones; whoever runs projects can switch between theirs and all of their
+  // projects; the PMO and executives see everything.
+  const overview = can('projects.view_all') || can('projects.edit_all');
+  const teamMember = !overview && !LEADS_PROJECTS.some((p) => can(p));
+  const [whose, setWhoseState] = useState<'mine' | 'all'>(() => (safeGet('pmo.msWhose') === 'mine' ? 'mine' : 'all'));
+  const setWhose = (v: 'mine' | 'all') => (setWhoseState(v), safeSet('pmo.msWhose', v));
+  // Mine | All only where it changes the list: some milestones are theirs and some are not (the PMO and executives too).
+  const offerWhose = !teamMember && Boolean(all?.some((m) => m.mine) && all?.some((m) => !m.mine));
+  const onlyMine = teamMember || (offerWhose && whose === 'mine');
+  const data = useMemo(() => (all ? (onlyMine ? all.filter((m) => m.mine) : all) : null), [all, onlyMine]);
   const [view, setView] = useState<'list' | 'departments'>(() => (hashParam('view') === 'departments' ? 'departments' : 'list'));
   const [status, setStatus] = useState<StatusFilter>(() => (hashParam('status') as StatusFilter) || 'open');
   const [respDept, setRespDept] = useState<string>(() => hashParam('dept') ?? '');
-  const [owner, setOwner] = useState<string>('');
+  const [owner, setOwner] = useState<string>(() => (hashParam('owner') === 'none' ? NO_OWNER : ''));
   const [query, setQuery] = useState('');
+  const [dates, setDates] = useState<Range>(ALL_DATES);
   const [limit, setLimit] = useState(PAGE);
 
   const isOpen = (m: MilestoneRow) => m.status !== 'done' && m.status !== 'cancelled';
@@ -68,7 +86,7 @@ export function Milestones() {
     }
   };
 
-  const rows = data ?? [];
+  const rows = useMemo(() => (data ?? []).filter((m) => inRange(m.date, dates)), [data, dates]);
   const counts = useMemo(
     () => ({
       overdue: rows.filter(isOverdue).length,
@@ -107,7 +125,7 @@ export function Milestones() {
       (m) =>
         byStatus(m, status) &&
         (!respDept || (m.responsibleDept ?? t('unassignedDept')) === respDept) &&
-        (!owner || m.ownerName === owner || (m.coOwners ?? '').split(', ').includes(owner)) &&
+        (!owner || (owner === NO_OWNER ? !m.ownerName && !m.coOwners : m.ownerName === owner) || (m.coOwners ?? '').split(', ').includes(owner)) &&
         (!q || `${m.code ?? ''} ${m.name} ${m.projectCode} ${m.projectName} ${m.ownerName ?? ''}`.toLowerCase().includes(q)),
     );
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -126,9 +144,21 @@ export function Milestones() {
     <>
       <div className="page-head">
         <div>
-          <h1 className="page-title">{t('milestonesPage')}</h1>
+          <h1 className="page-title">{teamMember ? t('myMilestonesTitle') : t('milestonesPage')}</h1>
+          <LearnMore page="milestones" />
           <p className="page-sub">{t('milestonesSub', { n: rows.length, p: new Set(rows.map((m) => m.projectId)).size })}</p>
         </div>
+        {offerWhose && (
+          <Segmented
+            label={t('pf_whose')}
+            value={whose}
+            onChange={setWhose}
+            options={[
+              { value: 'mine', label: t('myMilestonesTitle') },
+              { value: 'all', label: overview ? t('msAllOverview') : t('msAllMine') },
+            ]}
+          />
+        )}
         <Segmented
           label={t('milestonesPage')}
           value={view}
@@ -147,7 +177,8 @@ export function Milestones() {
             className={`ms-stat ${s === 'overdue' ? 'is-bad' : s === 'stale' || s === 'warning' ? 'is-warn' : ''}`}
             aria-pressed={status === s}
             onClick={() => {
-              setStatus(s);
+              // Click the selected one again to clear it: back to Open (or to All, from Open).
+              setStatus(status === s ? (s === 'open' ? 'all' : 'open') : s);
               setView('list');
               setLimit(PAGE);
             }}
@@ -209,6 +240,7 @@ export function Milestones() {
               <MagnifyingGlass size={16} aria-hidden />
               <input className="input" type="search" placeholder={t('searchMilestones')} aria-label={t('searchMilestones')} value={query} onChange={(e) => setQuery(e.target.value)} />
             </div>
+            <DateRange value={dates} onChange={(r) => (setDates(r), setLimit(PAGE))} today={today} />
             <select className="select" style={{ width: 'auto', minWidth: 220 }} value={respDept} aria-label={t('responsibleDept')} onChange={(e) => setRespDept(e.target.value)}>
               <option value="">{t('allResponsibleDepts', { n: depts.length })}</option>
               {[...depts].sort((a, b) => a.name.localeCompare(b.name)).map((d) => (
@@ -219,6 +251,7 @@ export function Milestones() {
             </select>
             <select className="select" style={{ width: 'auto', minWidth: 200 }} value={owner} aria-label={t('responsibleOwner')} onChange={(e) => setOwner(e.target.value)}>
               <option value="">{t('allOwners')}</option>
+              <option value={NO_OWNER}>{t('unassigned')}</option>
               {owners.map((o) => (
                 <option key={o} value={o}>
                   {o}
@@ -246,6 +279,9 @@ export function Milestones() {
             </div>
           ) : (
             <div className="panel table-wrap">
+              <div style={{ padding: '12px 14px 0' }}>
+                <MsLegend />
+              </div>
               <table className="table ms-table">
                 <thead>
                   <tr>
@@ -263,9 +299,16 @@ export function Milestones() {
                     const late = isOverdue(m);
                     const slip = m.baselineDate ? diffDays(m.baselineDate, m.date) : 0;
                     const d = dept(m.departmentId);
+                    const tone = milestoneTone(m, today);
                     return (
-                      <tr key={m.id} className="clickable enter" style={stagger(i)} onClick={() => navigate(`/projects/${m.projectId}/plan?task=${m.id}`)}>
-                        <td className="num" style={{ whiteSpace: 'nowrap' }}>
+                      <tr
+                        key={m.id}
+                        className={`${m.openable === false ? "row-locked" : "clickable"} enter`}
+                        style={stagger(i)}
+                        title={m.openable === false ? t("notYourTask") : undefined}
+                        onClick={() => m.openable !== false && navigate(`/projects/${m.projectId}/plan?task=${m.id}`)}
+                      >
+                        <td className={`num ms-stripe ms-tone-${tone}`} style={{ whiteSpace: 'nowrap' }}>
                           <div style={{ fontWeight: 500, color: late ? 'var(--bad)' : undefined }}>{fmtDate(m.date, lang, true)}</div>
                           <div className="code">
                             {m.status === 'done' ? t('milestoneDone') : relativeDays(m.date, today, lang)}
@@ -306,10 +349,7 @@ export function Milestones() {
                         </td>
                         <td className="ink-2" style={{ fontSize: 13 }}>{m.responsibleDept ?? '-'}</td>
                         <td>
-                          <span className={`pill ${m.status === 'done' ? '' : late ? 'h-off_track' : m.status === 'cancelled' ? '' : 'h-on_track'}`}>
-                            {late ? t('milestoneLate') : t(`status_${m.status}`)}
-                            {isOpen(m) && m.progress > 0 && <span className="num">{m.progress}%</span>}
-                          </span>
+                          <MsPill tone={tone} progress={m.progress} />
                           {(() => {
                             const f = flagsOf(m);
                             return (

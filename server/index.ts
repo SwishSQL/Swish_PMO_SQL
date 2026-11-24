@@ -7,9 +7,11 @@ import cookieParser from 'cookie-parser';
 import compression from 'compression';
 import { db, dbKind, initDb } from './db';
 import { HttpError, requireAuth } from './auth';
+import { inboundRouter } from './routes/inbound';
 import { authRouter } from './routes/auth';
 import { metaRouter } from './routes/meta';
 import { projectsRouter } from './routes/projects';
+import { attachmentsRouter } from './routes/attachments';
 import { exportRouter } from './routes/export';
 import { followupRouter } from './routes/followup';
 import { notificationsRouter } from './routes/notifications';
@@ -19,9 +21,16 @@ import { askRouter } from './routes/ask';
 import { changesRouter } from './routes/changes';
 import { transformationRouter } from './routes/transformation';
 import { trackerRouter } from './routes/tracker';
+import { meetingRouter } from './routes/meeting';
 import { applyPlanLinks, seedPlan } from './transformation';
 import { startReminderJob } from './notify';
 import { runSeeds } from './seed';
+import { actionsRouter } from './routes/actions';
+import { ownersRouter } from './routes/owners';
+import { staffRouter } from './routes/staff';
+import { addClosureMilestones } from './service';
+import { mentionWatcher } from './mentions';
+import { aipmRouter } from './routes/aipm';
 
 const app = express();
 const port = Number(process.env.PORT ?? 8090);
@@ -51,6 +60,10 @@ app.use((req, res, next) => {
 app.use(compression());
 // A request to close a project carries its Delivery Document as a file (base64), so this route takes a larger body.
 app.use('/api/projects/:id/closure-request', express.json({ limit: '40mb' }));
+// A reply posted by the mail service carries its attachments too.
+app.use('/api/inbound', express.json({ limit: '40mb' }));
+// A file attached to a milestone (base64, up to 8 MB).
+app.use('/api/tasks/:taskId/attachments', express.json({ limit: '12mb' }));
 app.use(express.json({ limit: '4mb' }));
 app.use(cookieParser());
 
@@ -68,10 +81,15 @@ app.get('/api/health', async (_req, res) => {
   }
 });
 app.use('/api/auth', authRouter);
+// Replies by email come from the mail service, not a signed-in person: the route checks its own secret.
+app.use('/api', inboundRouter);
 // Everything below needs a session. Checked once here, not once per router.
 app.use('/api', requireAuth);
+// Text that names someone as @Full Name tells them, once the save went through.
+app.use('/api', mentionWatcher);
 app.use('/api', metaRouter);
 app.use('/api', projectsRouter);
+app.use('/api', attachmentsRouter);
 app.use('/api', exportRouter);
 app.use('/api', followupRouter);
 app.use('/api', notificationsRouter);
@@ -81,6 +99,11 @@ app.use('/api', askRouter);
 app.use('/api', changesRouter);
 app.use('/api', transformationRouter);
 app.use('/api', trackerRouter);
+app.use('/api', meetingRouter);
+app.use('/api', actionsRouter);
+app.use('/api', ownersRouter);
+app.use('/api', staffRouter);
+app.use('/api', aipmRouter);
 app.use('/api', (_req, res) => res.status(404).json({ error: 'Unknown endpoint.' }));
 
 app.use((error: unknown, _req: Request, res: Response, _next: NextFunction) => {
@@ -96,6 +119,9 @@ app.use((error: unknown, _req: Request, res: Response, _next: NextFunction) => {
 const clientDir = path.resolve(__dirname, '../client');
 if (fs.existsSync(clientDir)) {
   app.use('/assets', express.static(path.join(clientDir, 'assets'), { immutable: true, maxAge: '1y' }));
+  // A file of an older version is gone: say so (404), never answer with the page itself, which the browser cannot
+  // run as code (the open page then reloads itself onto the new version).
+  app.use('/assets', (_req, res) => res.status(404).type('text/plain').send('Not found'));
   app.use(express.static(clientDir, { etag: true, maxAge: 0 }));
   app.get('*', (_req, res) => {
     res.setHeader('Cache-Control', 'no-cache');
@@ -108,6 +134,7 @@ async function start(): Promise<void> {
   await runSeeds();
   await seedPlan();
   await applyPlanLinks();
+  await addClosureMilestones();
   app.listen(port, () => console.log(`SWiSH PMO listening on :${port}`));
   startReminderJob();
 }

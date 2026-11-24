@@ -1,4 +1,5 @@
 import '@fontsource/ibm-plex-sans/400.css';
+import { LEADS_PROJECTS } from '../shared/permissions';
 import '@fontsource/ibm-plex-sans/500.css';
 import '@fontsource/ibm-plex-sans/600.css';
 import '@fontsource/ibm-plex-sans-arabic/400.css';
@@ -9,8 +10,10 @@ import { StrictMode, Suspense, lazy, useCallback, useEffect, useMemo, useState }
 import { createRoot } from 'react-dom/client';
 import { AnimatePresence, MotionConfig, motion } from 'motion/react';
 import { EASE_OUT } from './lib/motion';
+import { installTableSort } from './lib/tableSort';
 import type { Meta } from '../shared/types';
 import { api } from './api';
+import { UnsavedPrompt } from './lib/unsaved';
 import { AppProvider, ToastProvider, clearLoadCache, navigate, safeGet, safeSet, useRoute } from './lib/app';
 import { LangContext, makeT } from './lib/i18n';
 import type { Lang } from './lib/i18n';
@@ -20,15 +23,19 @@ import { Login } from './pages/Login';
 import { ChoosePassword } from './pages/ChoosePassword';
 import { Portfolio } from './pages/Portfolio';
 import { MyWork } from './pages/MyWork';
+import { Assignments } from './pages/Assignments';
+import { Insights } from './pages/Insights';
+import { ErrorBoundary } from './components/ErrorBoundary';
+import { installFreshVersion, lazyPage } from './lib/fresh';
 
 // Only the Portfolio, the sign-in and My work ride in the first download. The rest load the first
 // time they are opened (the plan editor and the admin pages are the bulk of the code).
-const ProjectPage = lazy(() => import('./pages/ProjectPage').then((m) => ({ default: m.ProjectPage })));
-const WeeklyReview = lazy(() => import('./pages/WeeklyReview').then((m) => ({ default: m.WeeklyReview })));
-const Report = lazy(() => import('./pages/Report').then((m) => ({ default: m.Report })));
-const Milestones = lazy(() => import('./pages/Milestones').then((m) => ({ default: m.Milestones })));
-const Dashboard = lazy(() => import('./pages/Dashboard').then((m) => ({ default: m.Dashboard })));
-const People = lazy(() => import('./pages/People').then((m) => ({ default: m.People })));
+const ProjectPage = lazy(lazyPage(() => import('./pages/ProjectPage').then((m) => ({ default: m.ProjectPage }))));
+const WeeklyReview = lazy(lazyPage(() => import('./pages/WeeklyReview').then((m) => ({ default: m.WeeklyReview }))));
+const Report = lazy(lazyPage(() => import('./pages/Report').then((m) => ({ default: m.Report }))));
+const Milestones = lazy(lazyPage(() => import('./pages/Milestones').then((m) => ({ default: m.Milestones }))));
+const Dashboard = lazy(lazyPage(() => import('./pages/Dashboard').then((m) => ({ default: m.Dashboard }))));
+const People = lazy(lazyPage(() => import('./pages/People').then((m) => ({ default: m.People }))));
 
 function systemTheme(): 'light' | 'dark' {
   return window.matchMedia?.('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
@@ -116,13 +123,15 @@ function App() {
     body = <ChoosePassword onDone={reloadMeta} onSignOut={signOut} />;
   } else {
     const [top, id, sub] = route;
+    // Team members have no Weekly Stand-up or Dashboard: those are for whoever files updates or oversees projects.
+    const leads = LEADS_PROJECTS.some((p) => meta.permissions.includes(p));
     let page;
     switch (top) {
       case 'projects':
         page = id ? <ProjectPage key={id} id={Number(id)} tab={sub ?? 'plan'} /> : <Portfolio />;
         break;
       case 'updates':
-        page = <WeeklyReview meeting={id === 'meeting'} />;
+        page = leads ? <WeeklyReview meeting={id === 'meeting'} /> : <Portfolio />;
         break;
       case 'report':
         page = meta.permissions.includes('report.view') ? <Report /> : <Portfolio />;
@@ -130,14 +139,25 @@ function App() {
       case 'my-work':
         page = <MyWork />;
         break;
+      case 'assignments':
+        page = <Assignments />;
+        break;
+      case 'insights':
+        page = meta.permissions.includes('projects.edit_all') ? <Insights /> : <Portfolio />;
+        break;
+      case 'org':
+        // The org chart lives under Users & permissions now; old links land there.
+        navigate(meta.canManageUsers ? '/people/org' : '/portfolio');
+        page = <Portfolio />;
+        break;
       case 'people':
         page = meta.canManageUsers ? <People tab={id ?? 'users'} /> : <Portfolio />;
         break;
       case 'dashboard':
-        page = <Dashboard />;
+        page = leads ? <Dashboard /> : <Portfolio />;
         break;
       case 'milestones':
-        page = <Milestones />;
+        page = leads ? <Milestones /> : <MyWork />;
         break;
       default:
         page = <Portfolio path={route} />;
@@ -168,7 +188,10 @@ function App() {
   return (
     <MotionConfig reducedMotion="user">
       <LangContext.Provider value={langValue}>
-        <ToastProvider>{body}</ToastProvider>
+        <ToastProvider>
+          {body}
+          <UnsavedPrompt />
+        </ToastProvider>
       </LangContext.Provider>
     </MotionConfig>
   );
@@ -176,6 +199,11 @@ function App() {
 
 createRoot(document.getElementById('root')!).render(
   <StrictMode>
-    <App />
+    <ErrorBoundary>
+      <App />
+    </ErrorBoundary>
   </StrictMode>,
 );
+
+installTableSort();
+installFreshVersion();

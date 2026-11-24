@@ -1,15 +1,23 @@
-import { useEffect, useState } from 'react';
-import { ArrowRight, CalendarX, Check, PaperPlaneRight, Siren, Trash, X } from '@phosphor-icons/react';
-import type { DeadlineChange, Dependency, Escalation, MilestoneUpdate, Task, TaskStatus, User } from '../../shared/types';
+import { useEffect, useRef, useState } from 'react';
+import type { ReactNode } from 'react';
+import { ArrowRight, CalendarX, Check, DotsThree, PaperPlaneRight, Siren, Trash, X } from '@phosphor-icons/react';
+import type { DeadlineChange, Dependency, Escalation, EscalationStep, MilestoneUpdate, OwnerRequest, Task, TaskStatus, User } from '../../shared/types';
+import { OwnerPicker } from './OwnerPicker';
 import { spanDays } from '../../shared/dates';
 import { api } from '../api';
 import { useApp, useToast } from '../lib/app';
 import { dayOffLabel, useCalendar } from '../lib/calendar';
 import { useT } from '../lib/i18n';
+import { confirmLeave, useUnsaved } from '../lib/unsaved';
 import type { Key as TKey } from '../lib/i18n';
 import { fmtDate, fmtDateTime } from '../lib/format';
 import { stagger } from '../lib/motion';
 import { Drawer, Field } from './ui';
+import { DateInput } from './DateInput';
+import { MentionTextarea } from './MentionTextarea';
+import { MentionText } from './MentionText';
+import { LearnMore } from './Tour';
+import { TaskAttachments } from './TaskAttachments';
 
 interface Props {
   task: Task;
@@ -33,6 +41,8 @@ interface Props {
   canGovern: boolean;
   /** Reload the project after something that can change its dates (a rejected move). */
   onReload: () => void;
+  /** Opened to complete it (status Done, 100%) or to reopen it: the update form starts there, the comment ready. */
+  preset?: 'done' | 'reopen';
 }
 
 export function TaskPanel(p: Props) {
@@ -41,6 +51,8 @@ export function TaskPanel(p: Props) {
   const [name, setName] = useState(task.name);
   const [notes, setNotes] = useState(task.notes ?? '');
   const [progress, setProgress] = useState(task.progress);
+  // A milestone with tasks under it takes its % from them.
+  const fromTasks = task.kind === 'milestone' && p.tasks.some((x) => x.parentId === task.id && x.status !== 'cancelled');
   const [newPred, setNewPred] = useState<number | ''>('');
   const [lag, setLag] = useState(0);
   const [ownerName, setOwnerName] = useState(task.ownerName ?? '');
@@ -53,15 +65,32 @@ export function TaskPanel(p: Props) {
   const [comment, setComment] = useState('');
   const [posting, setPosting] = useState(false);
   const [log, setLog] = useState<MilestoneUpdate[] | null>(null);
+  // A request for an owner from another department, waiting for its head (or a system admin).
+  const [ownerAsk, setOwnerAsk] = useState<OwnerRequest | null>(null);
+  const [askTick, setAskTick] = useState(0);
+  useEffect(() => {
+    if (!p.canGovern || task.kind === 'summary') return;
+    let live = true;
+    api
+      .get<OwnerRequest[]>(`/api/projects/${task.projectId}/owner-requests`)
+      .then((rs) => live && setOwnerAsk(rs.find((r) => r.taskId === task.id) ?? null))
+      .catch(() => undefined);
+    return () => {
+      live = false;
+    };
+  }, [task.id, task.projectId, task.assigneeId, p.canGovern, task.kind, askTick]);
   const { lang } = useT();
   const { meta, can } = useApp();
   const cal = useCalendar();
   const toast = useToast();
   const [changes, setChanges] = useState<DeadlineChange[]>([]);
   const [escs, setEscs] = useState<Escalation[]>([]);
+  const [steps, setSteps] = useState<EscalationStep[]>([]);
   const [escTo, setEscTo] = useState('');
   const [escNote, setEscNote] = useState('');
+  const [escLevel, setEscLevel] = useState<number | null>(null);
   const [busy, setBusy] = useState(false);
+  const commentRef = useRef<HTMLTextAreaElement>(null);
 
   useEffect(() => {
     setName(task.name);
@@ -73,7 +102,14 @@ export function TaskPanel(p: Props) {
     setDept(task.responsibleDept ?? '');
     setEscalate(task.escalateTo ?? '');
     setBlocker(task.blocker ?? '');
-  }, [task.id, task.name, task.notes, task.progress, task.status, task.ownerName, task.coOwners, task.responsibleDept, task.escalateTo, task.blocker]);
+    if (p.preset === 'done' && task.status !== 'done') {
+      setStatus('done');
+      setProgress(100);
+    } else if (p.preset === 'reopen' && task.status === 'done') {
+      setStatus('in_progress');
+    }
+    if (p.preset) window.setTimeout(() => commentRef.current?.focus(), 250);
+  }, [p.preset, task.id, task.name, task.notes, task.progress, task.status, task.ownerName, task.coOwners, task.responsibleDept, task.escalateTo, task.blocker]);
 
   // Every update posted on this item, newest first.
   const loadLog = async (id: number) => {
@@ -99,11 +135,13 @@ export function TaskPanel(p: Props) {
     Promise.all([
       api.get<DeadlineChange[]>(`/api/tasks/${id}/changes`).catch(() => [] as DeadlineChange[]),
       api.get<Escalation[]>(`/api/tasks/${id}/escalations`).catch(() => [] as Escalation[]),
+      api.get<EscalationStep[]>(`/api/tasks/${id}/escalation-ladder`).catch(() => [] as EscalationStep[]),
     ]);
   const loadFollow = async (id: number) => {
-    const [c, e] = await fetchFollow(id);
+    const [c, e, l] = await fetchFollow(id);
     setChanges(c);
     setEscs(e);
+    setSteps(l);
   };
   useEffect(() => {
     let live = true;
@@ -112,10 +150,11 @@ export function TaskPanel(p: Props) {
     setEscNote('');
     setEscTo(task.escalateTo ?? '');
     if (task.kind !== 'summary') {
-      fetchFollow(task.id).then(([c, e]) => {
+      fetchFollow(task.id).then(([c, e, l]) => {
         if (!live) return;
         setChanges(c);
         setEscs(e);
+        setSteps(l);
       });
     }
     return () => {
@@ -142,7 +181,8 @@ export function TaskPanel(p: Props) {
     });
   const raiseEscalation = () =>
     guarded(async () => {
-      await api.post(`/api/tasks/${task.id}/escalations`, { toName: escTo.trim(), note: escNote.trim() || null });
+      await api.post(`/api/tasks/${task.id}/escalations`, { note: escNote.trim() || null, level: can('projects.edit_all') && escLevel ? escLevel : undefined });
+      setEscLevel(null);
       setEscNote('');
       await loadFollow(task.id);
       toast(t('escalated'));
@@ -155,22 +195,54 @@ export function TaskPanel(p: Props) {
 
   // The Post button sends everything at once, so the server writes one history row.
   const dirty = status !== task.status || progress !== task.progress || blocker.trim() !== (task.blocker ?? '') || comment.trim() !== '';
-  const post = async () => {
+  // Closing the panel with an update not posted asks first.
+  const close = async () => {
+    if (await confirmLeave()) p.onClose();
+  };
+  const discardUpdate = () => {
+    setStatus(task.status);
+    setProgress(task.progress);
+    setBlocker(task.blocker ?? '');
+    setComment('');
+  };
+  useUnsaved(dirty && p.canEdit, t('unsavedUpdateOf', { name: task.name }), () => post(), discardUpdate);
+  const post = async (): Promise<boolean> => {
     setPosting(true);
     try {
-      await p.onPatch({
+      const saved = await p.onPatch({
         status,
-        progress,
+        ...(fromTasks ? {} : { progress }),
         blocker: blocker.trim() || null,
         ...(comment.trim() ? { updateComment: comment.trim() } : {}),
       } as Partial<Task>);
+      // Cancelled at the confirmation (or refused): what was typed stays.
+      if (saved === null || saved === undefined) return false;
       setComment('');
       setLog(await loadLog(task.id));
+      return true;
     } finally {
       setPosting(false);
     }
   };
   const authorOf = (u: MilestoneUpdate) => (u.authorId ? p.users.find((x) => x.id === u.authorId)?.name : null) ?? t('fromTrackerImport');
+
+  const people = p.users.filter((u) => u.active).sort((a, b) => a.name.localeCompare(b.name));
+  const personSelect = (value: string, onPick: (name: string | null) => void, label: string, empty: string) => (
+    <select className="select" aria-label={label} value={value} disabled={lockPlan} onChange={(e) => onPick(e.target.value || null)}>
+      <option value="">{empty}</option>
+      {value && !people.some((u) => u.name === value) && <option value={value}>{t('noAccountName', { n: value })}</option>}
+      {people.map((u) => (
+        <option key={u.id} value={u.name}>
+          {u.name}
+        </option>
+      ))}
+    </select>
+  );
+  const coList = (task.coOwners ?? '')
+    .split(/\s*[,،]\s*/)
+    .map((s) => s.trim())
+    .filter(Boolean);
+  const deptNames = [...new Set([...meta.departments.map((d) => d.name), ...(task.responsibleDept ? [task.responsibleDept] : [])])];
 
   // Save a text field when focus leaves it, and only if it changed.
   const saveText = (key: keyof Task, value: string, current: string | null) =>
@@ -182,10 +254,50 @@ export function TaskPanel(p: Props) {
     (x) => x.id !== task.id && x.kind !== 'summary' && !preds.some((d) => d.predecessorId === x.id),
   );
   const ro = !p.canEdit;
+  // The plan itself (name, dates, owner, links, notes) is the manager's: someone working on the task reports on it.
+  const lockPlan = ro || !p.canGovern;
   const isSummary = task.kind === 'summary';
+  // Someone working on the task without running the project: a short panel. The update first, the facts as one line,
+  // the rest folded.
+  const compact = !p.canGovern && !isSummary;
+  // The project manager on a milestone or task: the state at a glance, the update first, the details folded.
+  const managed = p.canGovern && !isSummary;
+  const detailsRef = useRef<HTMLDetailsElement>(null);
+  const [menuOpen, setMenuOpen] = useState(false);
+  const openDetails = () => {
+    const d = detailsRef.current;
+    if (!d) return;
+    d.open = true;
+    d.scrollIntoView({ block: 'start', behavior: 'smooth' });
+  };
+  const todayIso = new Date().toISOString().slice(0, 10);
+  const lateDays =
+    task.status !== 'done' && task.status !== 'cancelled' && task.endDate < todayIso ? Math.round((Date.parse(todayIso) - Date.parse(task.endDate)) / 86_400_000) : 0;
+  const detailsFold = (node: ReactNode) =>
+    managed ? (
+      <details className="fold" ref={detailsRef} data-tour="details">
+        <summary>{t('details')}</summary>
+        <div className="fold-body">{node}</div>
+      </details>
+    ) : (
+      node
+    );
+  const fold = (label: string, open: boolean, node: ReactNode, tour?: string) =>
+    compact || managed ? (
+      <details className="fold" open={open} data-tour={tour}>
+        <summary>{label}</summary>
+        {node}
+      </details>
+    ) : tour ? (
+      <div data-tour={tour}>{node}</div>
+    ) : (
+      node
+    );
+  const ownerLabel = task.ownerName ?? p.users.find((u) => u.id === task.assigneeId)?.name ?? null;
+  const ownerShown = ownerAsk && !task.assigneeId ? `${t('op_waiting')}: ${ownerAsk.userName ?? ownerAsk.departmentName}` : (ownerLabel ?? t('unassigned'));
 
   return (
-    <Drawer onClose={p.onClose} label={task.name}>
+    <Drawer onClose={close} label={task.name}>
       <div className="dialog-head" style={{ paddingBottom: 14, borderBottom: '1px solid var(--line)' }}>
         <div>
           <div className="code">
@@ -196,37 +308,77 @@ export function TaskPanel(p: Props) {
             {task.name}
           </h2>
         </div>
-        <button className="btn btn-ghost btn-icon btn-sm" onClick={p.onClose} aria-label={t('close')}>
-          <X size={16} />
-        </button>
+        <div style={{ display: 'flex', gap: 2, alignItems: 'flex-start' }}>
+          <LearnMore page="task" />
+          {managed && !ro && !task.systemKey && (
+            <div
+              className="mini-menu-wrap"
+              onBlur={(e) => {
+                if (!e.currentTarget.contains(e.relatedTarget as Node | null)) setMenuOpen(false);
+              }}
+            >
+              <button className="btn btn-ghost btn-icon btn-sm" aria-label={t('tp_more')} aria-haspopup="menu" aria-expanded={menuOpen} onClick={() => setMenuOpen((o) => !o)}>
+                <DotsThree size={18} weight="bold" />
+              </button>
+              {menuOpen && (
+                <div className="mini-menu" role="menu">
+                  <button role="menuitem" className="btn btn-ghost btn-sm btn-danger" onClick={() => (setMenuOpen(false), p.onDelete())}>
+                    <Trash size={15} aria-hidden />
+                    {t('delete')}
+                  </button>
+                </div>
+              )}
+            </div>
+          )}
+          <button className="btn btn-ghost btn-icon btn-sm" onClick={close} aria-label={t('close')}>
+            <X size={16} />
+          </button>
+        </div>
       </div>
       <div className="dialog-body" style={{ display: 'grid', gap: 18, flex: 1 }}>
-        {!isSummary && p.dependencies.length > 0 && (
-          <div
-            className="pill"
-            style={{
-              justifySelf: 'start',
-              height: 'auto',
-              padding: '6px 10px',
-              whiteSpace: 'normal',
-              background: p.isCritical ? 'var(--bad-soft)' : 'var(--surface-2)',
-              color: p.isCritical ? 'var(--bad)' : 'var(--ink-2)',
-            }}
-          >
-            {p.isCritical ? t('onCriticalPath') : t('floatDays', { n: Math.max(0, p.floatDays ?? 0) })}
+        {managed && (
+          <div className="state-chips">
+            {lateDays > 0 && <span className="flag-chip bad">{t('tp_daysLate', { n: lateDays })}</span>}
+            <span className="flag-chip">
+              {t(`status_${task.status}`)} · {task.progress}%
+            </span>
+            {task.kind === 'milestone' && !task.baselineEnd && !task.systemKey && <span className="flag-chip warn">{t('tp_datesNotApproved')}</span>}
+            {p.dependencies.length > 0 && (
+              <span className={`flag-chip ${p.isCritical ? 'bad' : ''}`}>{p.isCritical ? t('onCriticalPath') : t('floatDays', { n: Math.max(0, p.floatDays ?? 0) })}</span>
+            )}
+          </div>
+        )}
+        {managed && (
+          <div className="fact-tiles">
+            {[
+              [task.kind === 'milestone' ? t('dueDate') : t('finish'), fmtDate(task.endDate, lang, true)],
+              [t('owner'), ownerShown],
+              [t('responsibleDept'), task.responsibleDept || '-'],
+              [t('escalateTo'), task.escalateTo || '-'],
+            ].map(([k, v]) => (
+              <button key={k} type="button" className="fact-tile" onClick={openDetails} title={t('tp_editInDetails')}>
+                <span>{k}</span>
+                <strong>{v}</strong>
+              </button>
+            ))}
           </div>
         )}
 
-        <Field label={t('taskName')}>
-          <input
-            className="input"
-            value={name}
-            disabled={ro}
-            onChange={(e) => setName(e.target.value)}
-            onBlur={() => name.trim() && name !== task.name && p.onPatch({ name: name.trim() })}
-          />
-        </Field>
-
+        {compact && (
+          <p className="facts-line">
+            {[
+              `${t('dueDate')} ${fmtDate(task.endDate, lang, true)}`,
+              ownerLabel && `${t('owner')} ${ownerLabel}`,
+              task.coOwners && `${t('coOwners')} ${task.coOwners}`,
+              task.responsibleDept,
+              task.escalateTo && `${t('escalateTo')} ${task.escalateTo}`,
+            ]
+              .filter(Boolean)
+              .map((x, i) => (
+                <span key={i}>{x}</span>
+              ))}
+          </p>
+        )}
         {isSummary && (
           <label className="field" style={{ display: 'flex', gap: 10, alignItems: 'flex-start' }}>
             <input type="checkbox" checked={task.notRequired} disabled={ro || !p.canGovern} onChange={(e) => p.onPatch({ notRequired: e.target.checked })} style={{ marginTop: 3 }} />
@@ -235,108 +387,6 @@ export function TaskPanel(p: Props) {
               <span className="hint" style={{ display: 'block' }}>{t('notRequiredHint')}</span>
             </span>
           </label>
-        )}
-
-        {!isSummary && (
-          <div className="form-grid">
-            <Field
-              label={task.kind === 'milestone' ? t('dueDate') : t('start')}
-              warn={dayOffLabel(cal, task.startDate, t, lang)}
-              hint={task.kind === 'milestone' && p.baselined ? t('cr_milestoneLocked') : undefined}
-            >
-              <input
-                className="input"
-                type="date"
-                value={task.startDate}
-                disabled={ro || (task.kind === 'milestone' && p.baselined)}
-                onChange={(e) => {
-                  if (!e.target.value) return;
-                  // Moving the start keeps the duration, as dragging the bar does.
-                  const len = spanDays(task.startDate, task.endDate) - 1;
-                  const end = new Date(Date.parse(e.target.value) + len * 86_400_000).toISOString().slice(0, 10);
-                  p.onPatch(task.kind === 'milestone' ? { startDate: e.target.value } : { startDate: e.target.value, endDate: end });
-                }}
-              />
-            </Field>
-            {task.kind === 'task' ? (
-              <Field
-                label={t('finish')}
-                warn={dayOffLabel(cal, task.endDate, t, lang)}
-                hint={t('workDaysCount', { n: cal.workdays(task.startDate, task.endDate) })}
-              >
-                <input
-                  className="input"
-                  type="date"
-                  value={task.endDate}
-                  min={task.startDate}
-                  disabled={ro}
-                  onChange={(e) => e.target.value && p.onPatch({ endDate: e.target.value })}
-                />
-              </Field>
-            ) : null}
-          </div>
-        )}
-
-        {!isSummary && (
-          <div className="form-grid">
-            {/* Always there, so a task can be turned back into a milestone and the other way round. */}
-            <Field label={t('kindLabel')}>
-              <select
-                className="select"
-                disabled={ro || (task.kind === 'milestone' && (!p.canGovern || p.baselined))}
-                value={task.kind}
-                onChange={(e) => p.onPatch({ kind: e.target.value as Task['kind'] })}
-              >
-                <option value="milestone">{t('kind_milestone')}</option>
-                <option value="task">{t('kind_task')}</option>
-              </select>
-            </Field>
-            <Field label={t('owner')}>
-              <select
-                className="select"
-                value={task.assigneeId ?? ''}
-                disabled={ro}
-                onChange={(e) => p.onPatch({ assigneeId: e.target.value ? Number(e.target.value) : null })}
-              >
-                <option value="">{t('unassigned')}</option>
-                {p.users
-                  .filter((u) => u.active && (can('projects.edit_all') || u.departmentId === p.departmentId || u.id === task.assigneeId))
-                  .map((u) => (
-                    <option key={u.id} value={u.id}>
-                      {u.name}
-                    </option>
-                  ))}
-              </select>
-            </Field>
-          </div>
-        )}
-
-        {!isSummary && (
-          <div className="form-grid">
-            <Field label={t('responsibleOwner')} hint={task.assigneeId ? t('linkedToUser') : t('fromTracker')} className="span-2">
-              <input
-                className="input"
-                value={ownerName}
-                disabled={ro}
-                onChange={(e) => setOwnerName(e.target.value)}
-                onBlur={() => saveText('ownerName', ownerName, task.ownerName)}
-              />
-            </Field>
-            <Field label={t('coOwners')}>
-              <input className="input" value={coOwners} disabled={ro} onChange={(e) => setCoOwners(e.target.value)} onBlur={() => saveText('coOwners', coOwners, task.coOwners)} />
-            </Field>
-            <Field label={t('responsibleDept')}>
-              <input className="input" value={dept} disabled={ro} onChange={(e) => setDept(e.target.value)} onBlur={() => saveText('responsibleDept', dept, task.responsibleDept)} />
-            </Field>
-            <Field label={t('escalateTo')}>
-              <input className="input" value={escalate} disabled={ro} onChange={(e) => setEscalate(e.target.value)} onBlur={() => saveText('escalateTo', escalate, task.escalateTo)} />
-            </Field>
-            {task.dependencyType && (
-              <Field label={t('dependency')}>
-                <input className="input" value={task.dependencyType.replace('_', ' ')} disabled readOnly />
-              </Field>
-            )}
-          </div>
         )}
 
         {/* One form, one history row: status, %, what happened and the blocker go together. */}
@@ -367,23 +417,23 @@ export function TaskPanel(p: Props) {
                   ))}
                 </select>
               </Field>
-              <Field label={`${t('progress')} ${progress}%`}>
+              <Field label={`${t('progress')} ${progress}%`} hint={fromTasks ? t('progressFromTasks') : undefined}>
                 <input
                   type="range"
                   min={0}
                   max={100}
                   step={5}
                   value={progress}
-                  disabled={ro}
+                  disabled={ro || fromTasks}
                   onChange={(e) => setProgress(Number(e.target.value))}
                   style={{ accentColor: 'var(--ink)', marginTop: 10 }}
                 />
               </Field>
               <Field label={t('whatHappened')} hint={t('whatHappenedHint')} className="span-2">
-                <textarea className="textarea" style={{ minHeight: 64 }} value={comment} disabled={ro} onChange={(e) => setComment(e.target.value)} />
+                <MentionTextarea ref={commentRef} className="textarea" style={{ minHeight: 64 }} value={comment} disabled={ro} onChange={(e) => setComment(e.target.value)} />
               </Field>
               <Field label={t('blockerLabel')} hint={t('blockerHint')} className="span-2">
-                <textarea className="textarea" style={{ minHeight: 48 }} value={blocker} disabled={ro} onChange={(e) => setBlocker(e.target.value)} />
+                <MentionTextarea className="textarea" style={{ minHeight: 48 }} value={blocker} disabled={ro} onChange={(e) => setBlocker(e.target.value)} />
               </Field>
             </div>
             {!ro && (
@@ -392,10 +442,264 @@ export function TaskPanel(p: Props) {
                 {t('postUpdateBtn')}
               </button>
             )}
+            {!ro && dirty && !posting && (
+              <span className="not-posted" role="status">
+                {t('notPostedYet')}
+              </span>
+            )}
+            {log && log.length > 0 && (log[0].comment || log[0].blocker) && (
+              <div className="latest-update">
+                <span className="muted">
+                  {t('latestUpdate')} · {authorOf(log[0])} · {log[0].authorId ? fmtDateTime(log[0].createdAt, lang) : fmtDate(log[0].createdAt.slice(0, 10), lang, true)}
+                </span>
+                {log[0].comment && (
+                  <p>
+                    <MentionText text={log[0].comment} />
+                  </p>
+                )}
+                {log[0].blocker && (
+                  <p className="update-log-blocker">
+                    {t('blockerLabel')}: {log[0].blocker}
+                  </p>
+                )}
+              </div>
+            )}
           </section>
         )}
 
-        {task.kind === 'milestone' && changes.length > 0 && (
+        {!isSummary && (
+          <TaskAttachments
+            taskId={task.id}
+            canGovern={!ro && p.canGovern}
+            canAttach={
+              !ro &&
+              (p.canGovern ||
+                task.assigneeId === meta.me.id ||
+                (task.coOwners ?? '').split(/[,;\n]/).some((n) => n.trim().toLowerCase() === meta.me.name.trim().toLowerCase()))
+            }
+          />
+        )}
+
+        {task.kind === 'milestone' && !ro && !p.canGovern && <AskMove task={task} baselined={Boolean(p.baselined)} onSent={p.onReload} />}
+
+        {detailsFold(
+          <>
+        {!compact && (
+        <Field label={t('taskName')}>
+          <input
+            className="input"
+            value={name}
+            disabled={lockPlan}
+            onChange={(e) => setName(e.target.value)}
+            onBlur={() => name.trim() && name !== task.name && p.onPatch({ name: name.trim() })}
+          />
+        </Field>
+        )}
+
+        {!compact && !isSummary && (
+          <div className="form-grid">
+            <Field
+              label={task.kind === 'milestone' ? t('dueDate') : t('start')}
+              warn={dayOffLabel(cal, task.startDate, t, lang)}
+              hint={task.kind === 'milestone' && p.baselined ? t('cr_milestoneLocked') : undefined}
+            >
+              <DateInput
+                className="input"
+                value={task.startDate}
+                disabled={lockPlan || (task.kind === 'milestone' && p.baselined)}
+                onChange={(e) => {
+                  if (!e.target.value) return;
+                  // Moving the start keeps the duration, as dragging the bar does.
+                  const len = spanDays(task.startDate, task.endDate) - 1;
+                  const end = new Date(Date.parse(e.target.value) + len * 86_400_000).toISOString().slice(0, 10);
+                  p.onPatch(task.kind === 'milestone' ? { startDate: e.target.value } : { startDate: e.target.value, endDate: end });
+                }}
+              />
+            </Field>
+            {task.kind === 'task' ? (
+              <Field
+                label={t('finish')}
+                warn={dayOffLabel(cal, task.endDate, t, lang)}
+                hint={t('workDaysCount', { n: cal.workdays(task.startDate, task.endDate) })}
+              >
+                <DateInput
+                  className="input"
+                  value={task.endDate}
+                  min={task.startDate}
+                  disabled={lockPlan}
+                  onChange={(e) => e.target.value && p.onPatch({ endDate: e.target.value })}
+                />
+              </Field>
+            ) : null}
+          </div>
+        )}
+
+        {!compact && !isSummary && (
+          <div className="form-grid">
+            {/* Always there, so a task can be turned back into a milestone and the other way round. */}
+            <Field label={t('kindLabel')}>
+              <select
+                className="select"
+                disabled={ro || (task.kind === 'milestone' && (!p.canGovern || p.baselined))}
+                value={task.kind}
+                onChange={(e) => p.onPatch({ kind: e.target.value as Task['kind'] })}
+              >
+                <option value="milestone">{t('kind_milestone')}</option>
+                <option value="task">{t('kind_task')}</option>
+              </select>
+            </Field>
+            <Field label={t('owner')}>
+              <select
+                className="select"
+                value={task.assigneeId ?? ''}
+                disabled={lockPlan}
+                hidden={!lockPlan}
+                onChange={(e) => {
+                  const u = p.users.find((x) => x.id === Number(e.target.value));
+                  p.onPatch({ assigneeId: u ? u.id : null, ownerName: u ? u.name : null });
+                }}
+              >
+                <option value="">{t('unassigned')}</option>
+                {p.users
+                  .filter((u) => u.active && (can('projects.edit_all') || u.departmentId === p.departmentId || u.id === task.assigneeId))
+                  .map((u) => (
+                    <option key={u.id} value={u.id}>
+                      {u.name}
+                    </option>
+                  ))}
+              </select>
+              {!lockPlan && (
+                <OwnerPicker
+                  task={task}
+                  users={p.users}
+                  departmentId={p.departmentId}
+                  disabled={lockPlan}
+                  pending={ownerAsk}
+                  onAssign={(u) => p.onPatch({ assigneeId: u ? u.id : null, ownerName: u ? u.name : null })}
+                  onChanged={() => (setAskTick((n) => n + 1), p.onReload())}
+                />
+              )}
+            </Field>
+          </div>
+        )}
+
+        {!compact && !isSummary && (
+          <div className="form-grid">
+            {!task.assigneeId && ownerName && (
+              <p className="muted span-2" style={{ margin: 0, fontSize: 12.5 }}>
+                {t('trackerOwnerNote', { n: ownerName })}
+              </p>
+            )}
+            <Field label={t('coOwners')} className="span-2">
+              <div className="chips-pick">
+                {coList.map((n) => (
+                  <span key={n} className="flag-chip">
+                    {n}
+                    {!lockPlan && (
+                      <button type="button" className="chip-x" aria-label={t('remove')} onClick={() => p.onPatch({ coOwners: coList.filter((x) => x !== n).join(', ') || null })}>
+                        ×
+                      </button>
+                    )}
+                  </span>
+                ))}
+                {!lockPlan &&
+                  personSelect('', (n) => n && !coList.includes(n) && p.onPatch({ coOwners: [...coList, n].join(', ') }), t('coOwners'), t('addCoOwner'))}
+              </div>
+            </Field>
+            <Field label={t('responsibleDept')}>
+              <select className="select" value={dept} disabled={lockPlan} onChange={(e) => (setDept(e.target.value), saveText('responsibleDept', e.target.value, task.responsibleDept))}>
+                <option value="">-</option>
+                {deptNames.map((n) => (
+                  <option key={n} value={n}>
+                    {n}
+                  </option>
+                ))}
+              </select>
+            </Field>
+            <Field label={t('escalateTo')}>
+              {personSelect(escalate, (n) => (setEscalate(n ?? ''), saveText('escalateTo', n ?? '', task.escalateTo)), t('escalateTo'), '-')}
+            </Field>
+            {task.dependencyType && (
+              <Field label={t('dependency')}>
+                <input className="input" value={task.dependencyType.replace('_', ' ')} disabled readOnly />
+              </Field>
+            )}
+          </div>
+        )}
+
+        {!compact && !isSummary && (
+          <div className="field">
+            <span>{t('predecessors')}</span>
+            {preds.length === 0 && <div className="muted" style={{ fontSize: 13 }}>-</div>}
+            {preds.map((d) => (
+              <div key={d.id} style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 13.5 }}>
+                <span style={{ flex: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                  {byId.get(d.predecessorId)?.name}
+                </span>
+                {d.lagDays !== 0 && <span className="code">+{d.lagDays}d</span>}
+                {!lockPlan && (
+                  <button className="btn btn-ghost btn-sm btn-icon" aria-label={t('remove')} onClick={() => p.onRemoveDependency(d.id)}>
+                    <X size={14} />
+                  </button>
+                )}
+              </div>
+            ))}
+            {!lockPlan && candidates.length > 0 && (
+              <div style={{ display: 'grid', gridTemplateColumns: '1fr 72px auto', gap: 6 }}>
+                <select className="select" aria-label={t('addPredecessor')} value={newPred} onChange={(e) => setNewPred(e.target.value ? Number(e.target.value) : '')}>
+                  <option value="">{t('addPredecessor')}</option>
+                  {candidates.map((c) => (
+                    <option key={c.id} value={c.id}>
+                      {c.name}
+                    </option>
+                  ))}
+                </select>
+                <input className="input num" type="number" aria-label={t('lag')} title={t('lag')} value={lag} onChange={(e) => setLag(Number(e.target.value))} />
+                <button
+                  className="btn"
+                  disabled={!newPred}
+                  onClick={() => {
+                    if (newPred) p.onAddDependency(newPred, lag);
+                    setNewPred('');
+                    setLag(0);
+                  }}
+                >
+                  {t('add')}
+                </button>
+              </div>
+            )}
+          </div>
+        )}
+
+        {task.systemKey === 'closure_docs' && (
+          <div className="closure-docs-box">
+            <p style={{ margin: '0 0 8px' }}>{t('closureDocsHint')}</p>
+            <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+              <a className="btn btn-sm" href="/api/templates/closure-report" download>
+                {t('closureReport')}
+              </a>
+              <a className="btn btn-sm" href="/api/templates/sign-off-checklist" download>
+                {t('closureChecklist')}
+              </a>
+            </div>
+          </div>
+        )}
+
+        {compact ? (task.notes ? fold(t('notes'), false, <p className="fold-text">{task.notes}</p>) : null) : (
+        <Field label={t('notes')}>
+          <MentionTextarea
+            className="textarea"
+            value={notes}
+            disabled={lockPlan}
+            onChange={(e) => setNotes(e.target.value)}
+            onBlur={() => notes !== (task.notes ?? '') && p.onPatch({ notes })}
+          />
+        </Field>
+        )}
+          </>,
+        )}
+
+        {task.kind === 'milestone' && changes.length > 0 && fold(`${t('deadlineChanges')} (${changes.length})`, false, (
           <div className="field">
             <span>
               <CalendarX size={14} aria-hidden style={{ verticalAlign: '-2px' }} /> {t('deadlineChanges')} ({changes.length})
@@ -429,9 +733,9 @@ export function TaskPanel(p: Props) {
               ))}
             </ol>
           </div>
-        )}
+        ))}
 
-        {!isSummary && (
+        {!isSummary && fold(`${t('escalations')}${escs.length ? ` (${escs.length})` : ''}`, escs.some((e) => !e.resolvedAt), (
           <div className="field">
             <span>
               <Siren size={14} aria-hidden style={{ verticalAlign: '-2px' }} /> {t('escalations')}
@@ -452,7 +756,11 @@ export function TaskPanel(p: Props) {
                       </strong>
                       <span className={`flag-chip ${e.resolvedAt ? '' : 'warn'}`}>{e.resolvedAt ? t('escClosed') : t('escOpen')}</span>
                     </div>
-                    {e.note && <p>{e.note}</p>}
+                    {e.note && (
+                      <p>
+                        <MentionText text={e.note} />
+                      </p>
+                    )}
                     <div className="muted" style={{ fontSize: 12 }}>
                       {who(e.raisedBy)} · {fmtDateTime(e.raisedAt, lang)}
                       {e.resolvedAt ? ` · ${t('escClosedOn', { d: fmtDateTime(e.resolvedAt, lang) })}` : ''}
@@ -466,24 +774,63 @@ export function TaskPanel(p: Props) {
                 ))}
               </ol>
             )}
-            {!ro && (
-              <div className="update-card" style={{ marginTop: 8 }}>
-                <Field label={t('escTo')} hint={t('escToHint')}>
-                  <input className="input" value={escTo} onChange={(e) => setEscTo(e.target.value)} />
-                </Field>
-                <Field label={t('escNote')}>
-                  <textarea className="textarea" style={{ minHeight: 48 }} value={escNote} onChange={(e) => setEscNote(e.target.value)} />
-                </Field>
-                <button className="btn" style={{ justifySelf: 'start' }} disabled={busy || !escTo.trim()} onClick={raiseEscalation}>
-                  <Siren size={15} aria-hidden />
-                  {t('escRaise', { n: Math.max(0, ...escs.filter((e) => !e.resolvedAt).map((e) => e.level)) + 1 })}
-                </button>
-              </div>
+            {steps.length > 0 && (
+              <ol className="esc-ladder" aria-label={t('escLadder')}>
+                {steps.map((st) => {
+                  const openAt = Math.max(0, ...escs.filter((e) => !e.resolvedAt).map((e) => e.level));
+                  return (
+                    <li key={st.level} className={st.level <= openAt ? 'is-on' : st.level === openAt + 1 ? 'is-next' : ''}>
+                      <span className="num">{st.level}</span>
+                      <span>
+                        <strong>{st.name}</strong>
+                        <small>{t(`escRole_${st.role}` as TKey)}</small>
+                      </span>
+                    </li>
+                  );
+                })}
+              </ol>
             )}
+            {steps.length > 0 && <div className="muted" style={{ fontSize: 12 }}>{t('escClimbNote')}</div>}
+            {!ro && (() => {
+              const openAt = Math.max(0, ...escs.filter((e) => !e.resolvedAt).map((e) => e.level));
+              // The PMO may pick a higher step (straight to the executives, say); others raise the next one.
+              const pmo = can('projects.edit_all');
+              const pickAt = pmo && escLevel && escLevel > openAt ? escLevel : openAt + 1;
+              const next = steps[pickAt - 1];
+              // A team member raises the first step; whoever runs the project takes it further.
+              if (!next) return null;
+              if (openAt >= 1 && !p.canGovern) return <div className="muted" style={{ fontSize: 13 }}>{t('escWithManager')}</div>;
+              return (
+                <div className="update-card" style={{ marginTop: 8 }}>
+                  <div style={{ fontSize: 13.5 }}>
+                    {pmo && steps.length - openAt > 1 && (
+                      <select className="select" style={{ width: 'auto', marginBottom: 6 }} aria-label={t('escPickLevel')} value={pickAt} onChange={(e) => setEscLevel(Number(e.target.value))}>
+                        {steps.slice(openAt).map((st) => (
+                          <option key={st.level} value={st.level}>
+                            {t('escLevel', { n: st.level })} · {t(`escRole_${st.role}` as TKey)}
+                          </option>
+                        ))}
+                      </select>
+                    )}
+                    <div>
+                    {t('escGoesTo')} <strong>{next.name}</strong> <span className="muted">({t(`escRole_${next.role}` as TKey)})</span>
+                    </div>
+                    {!next.hasAccount && <div style={{ color: 'var(--warn)', fontSize: 12.5, marginTop: 4 }}>{t('escNoAccount')}</div>}
+                  </div>
+                  <Field label={t('escNote')}>
+                    <MentionTextarea className="textarea" style={{ minHeight: 48 }} value={escNote} onChange={(e) => setEscNote(e.target.value)} />
+                  </Field>
+                  <button className="btn" style={{ justifySelf: 'start' }} disabled={busy || !escNote.trim()} onClick={raiseEscalation}>
+                    <Siren size={15} aria-hidden />
+                    {t('escRaise', { n: next.level })}
+                  </button>
+                </div>
+              );
+            })()}
           </div>
-        )}
+        ), 'escalations')}
 
-        {!isSummary && (
+        {!isSummary && fold(`${t('updateLog')}${log && log.length ? ` (${log.length})` : ''}`, false, (
           <div className="field">
             <span>
               {t('updateLog')}
@@ -508,7 +855,11 @@ export function TaskPanel(p: Props) {
                       <span className="tag">{t(`status_${u.status}`)}</span>
                       <span className="num">{u.progress}%</span>
                     </div>
-                    {u.comment && <p>{u.comment}</p>}
+                    {u.comment && (
+                      <p>
+                        <MentionText text={u.comment} />
+                      </p>
+                    )}
                     {u.blocker && (
                       <p className="update-log-blocker">
                         {t('blockerLabel')}: {u.blocker}
@@ -519,79 +870,96 @@ export function TaskPanel(p: Props) {
               </ol>
             )}
           </div>
-        )}
+        ), 'updatelog')}
 
-        {!isSummary && (
-          <div className="field">
-            <span>{t('predecessors')}</span>
-            {preds.length === 0 && <div className="muted" style={{ fontSize: 13 }}>-</div>}
-            {preds.map((d) => (
-              <div key={d.id} style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 13.5 }}>
-                <span style={{ flex: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                  {byId.get(d.predecessorId)?.name}
-                </span>
-                {d.lagDays !== 0 && <span className="code">+{d.lagDays}d</span>}
-                {!ro && (
-                  <button className="btn btn-ghost btn-sm btn-icon" aria-label={t('remove')} onClick={() => p.onRemoveDependency(d.id)}>
-                    <X size={14} />
-                  </button>
-                )}
-              </div>
-            ))}
-            {!ro && candidates.length > 0 && (
-              <div style={{ display: 'grid', gridTemplateColumns: '1fr 72px auto', gap: 6 }}>
-                <select className="select" aria-label={t('addPredecessor')} value={newPred} onChange={(e) => setNewPred(e.target.value ? Number(e.target.value) : '')}>
-                  <option value="">{t('addPredecessor')}</option>
-                  {candidates.map((c) => (
-                    <option key={c.id} value={c.id}>
-                      {c.name}
-                    </option>
-                  ))}
-                </select>
-                <input className="input num" type="number" aria-label={t('lag')} title={t('lag')} value={lag} onChange={(e) => setLag(Number(e.target.value))} />
-                <button
-                  className="btn"
-                  disabled={!newPred}
-                  onClick={() => {
-                    if (newPred) p.onAddDependency(newPred, lag);
-                    setNewPred('');
-                    setLag(0);
-                  }}
-                >
-                  {t('add')}
-                </button>
-              </div>
-            )}
-          </div>
-        )}
-
-        <Field label={t('notes')}>
-          <textarea
-            className="textarea"
-            value={notes}
-            disabled={ro}
-            onChange={(e) => setNotes(e.target.value)}
-            onBlur={() => notes !== (task.notes ?? '') && p.onPatch({ notes })}
-          />
-        </Field>
       </div>
-      {!ro && (
+      {!ro && !compact && (
         <div className="dialog-foot" style={{ justifyContent: 'space-between' }}>
-          {p.canGovern || (task.kind === 'task' && !p.tasks.some((c) => c.parentId === task.id)) ? (
+          {managed ? (
+            <span className="muted" style={{ fontSize: 12.5 }}>
+              {t('tp_autoSave')}
+            </span>
+          ) : task.systemKey ? null : p.canGovern ? (
             <button className="btn btn-ghost btn-danger" onClick={p.onDelete}>
               <Trash size={15} aria-hidden />
               {t('delete')}
             </button>
           ) : (
             <span className="muted" style={{ fontSize: 12.5 }}>
-              {t('deleteNeedsManager')}
+              {t('detailsByManager')}
             </span>
           )}
-          <button className="btn" onClick={p.onClose}>
+          <button className="btn" onClick={close}>
             {t('close')}
           </button>
         </div>
       )}
     </Drawer>
+  );
+}
+
+/** A team member cannot move a milestone: they ask the project manager, with the new date and the reason. */
+function AskMove({ task, baselined, onSent }: { task: Task; baselined: boolean; onSent: () => void }) {
+  const { t } = useT();
+  const toast = useToast();
+  const [open, setOpen] = useState(false);
+  const [to, setTo] = useState(task.endDate);
+  const [reason, setReason] = useState('');
+  const [busy, setBusy] = useState(false);
+  if (!open) {
+    return (
+      <button className="btn btn-sm" data-tour="askmove" style={{ justifySelf: 'start' }} onClick={() => setOpen(true)}>
+        <CalendarX size={15} aria-hidden /> {t('askMoveDate')}
+      </button>
+    );
+  }
+  const send = async () => {
+    if (to === task.endDate || reason.trim().length < 5) {
+      toast(t('askMoveNeeds'), 'bad');
+      return;
+    }
+    setBusy(true);
+    try {
+      // On an approved baseline the date changes by a change request; before it, as a move waiting for approval.
+      if (baselined) {
+        await api.post(`/api/projects/${task.projectId}/changes`, {
+          description: `Move "${task.name}" from ${task.endDate} to ${to}`,
+          reason: reason.trim(),
+          areas: ['schedule'],
+          changes: { milestones: [{ taskId: task.id, action: 'move', to }] },
+        });
+      } else {
+        await api.patch(`/api/tasks/${task.id}`, { endDate: to, changeReason: reason.trim() });
+      }
+      toast(t('askMoveSent'));
+      setOpen(false);
+      setReason('');
+      onSent();
+    } catch (e) {
+      toast((e as Error).message, 'bad');
+    } finally {
+      setBusy(false);
+    }
+  };
+  return (
+    <section className="update-card" aria-label={t('askMoveDate')}>
+      <strong>{t('askMoveDate')}</strong>
+      <div className="form-grid">
+        <Field label={t('askMoveTo')}>
+          <DateInput className="input" value={to} onChange={(e) => e.target.value && setTo(e.target.value)} />
+        </Field>
+        <Field label={t('askMoveWhy')} className="span-2">
+          <MentionTextarea className="textarea" style={{ minHeight: 56 }} value={reason} onChange={(e) => setReason(e.target.value)} />
+        </Field>
+      </div>
+      <div style={{ display: 'flex', gap: 8 }}>
+        <button className="btn btn-primary" disabled={busy} onClick={send}>
+          {t('askMoveSend')}
+        </button>
+        <button className="btn" onClick={() => setOpen(false)}>
+          {t('cancel')}
+        </button>
+      </div>
+    </section>
   );
 }

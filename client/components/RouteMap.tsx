@@ -200,7 +200,7 @@ export function RouteMap({ projects, departments, users, quarter, today, onOpen 
           // Same rule as the server's quarter list. The tail stops at the chart
           // edge when Today is outside the frame, so the label stays visible.
           const lateDays =
-            p.stage !== 'closed' && p.health !== 'done' && p.progress < 100 && p.endDate < today ? toDay(today) - toDay(p.endDate) : 0;
+            p.health !== 'done' && p.progress < 100 && p.endDate < today ? toDay(today) - toDay(p.endDate) : 0;
           const tailX = lateDays > 0 ? x(clampIso(today)) : xe;
           const pm = users.get(p.managerId ?? -1);
           const name = projectName(p, lang);
@@ -241,6 +241,7 @@ export function RouteMap({ projects, departments, users, quarter, today, onOpen 
                 </g>
                 <text className="rm-label" x={rtl ? width - 44 : 44} y={cy + 4.5} textAnchor={anchor}>
                   {short}
+                  {(p.blockedBy?.length ?? 0) > 0 ? ` · ${t('dep_blocked')}` : ''}
                 </text>
               </g>
 

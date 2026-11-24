@@ -9,6 +9,7 @@ import { useT } from '../lib/i18n';
 import { deptName, fmtDate, fmtDateTime } from '../lib/format';
 import { stagger } from '../lib/motion';
 import { Dialog, ErrorState, Field, deptColor } from '../components/ui';
+import { DateInput } from '../components/DateInput';
 
 // ---- Departments ----------------------------------------------------------------
 // The tracker's Departments page: each department with its head. Names in both languages are editable;
@@ -325,13 +326,13 @@ export function CalendarTab() {
               <input className="input" dir="rtl" value={draft.nameAr} onChange={(e) => setDraft({ ...draft, nameAr: e.target.value })} />
             </Field>
             <Field label={t('holidayFrom')}>
-              <input className="input" type="date" value={draft.from} onChange={(e) => setDraft({ ...draft, from: e.target.value })} />
+              <DateInput className="input" value={draft.from} onChange={(e) => setDraft({ ...draft, from: e.target.value })} />
             </Field>
             <Field
               label={t('holidayTo')}
               hint={span > 0 && span <= 31 ? t('holidaySpan', { n: span, w: weekdaysIn(draft.from, draft.to || draft.from) }) : t('holidayToHint')}
             >
-              <input className="input" type="date" min={draft.from || undefined} value={draft.to} onChange={(e) => setDraft({ ...draft, to: e.target.value })} />
+              <DateInput className="input" min={draft.from || undefined} value={draft.to} onChange={(e) => setDraft({ ...draft, to: e.target.value })} />
             </Field>
           </div>
         </Dialog>
@@ -372,6 +373,7 @@ const LABELS: Record<string, [string, string]> = {
   'project.created': ['Created a project', 'أنشأ مشروعًا'],
   'project.updated': ['Changed a project', 'عدّل مشروعًا'],
   'project.archived': ['Archived a project', 'أرشف مشروعًا'],
+  'project.deleted': ['Deleted a project', 'حذف مشروعًا'],
   'project.imported': ['Imported from the tracker', 'استورد من المتتبع'],
   'task.created': ['Added to a plan', 'أضاف إلى خطة'],
   'task.moved': ['Moved in a plan', 'حرّك في خطة'],
@@ -482,8 +484,8 @@ export function ActivityTab() {
             </option>
           ))}
         </select>
-        <input className="input" type="date" style={{ width: 'auto' }} aria-label={t('activityFrom')} value={from} onChange={(e) => (setFrom(e.target.value), setPage(1))} />
-        <input className="input" type="date" style={{ width: 'auto' }} aria-label={t('activityTo')} value={to} onChange={(e) => (setTo(e.target.value), setPage(1))} />
+        <DateInput className="input" style={{ width: 'auto' }} aria-label={t('activityFrom')} value={from} onChange={(e) => (setFrom(e.target.value), setPage(1))} />
+        <DateInput className="input" style={{ width: 'auto' }} aria-label={t('activityTo')} value={to} onChange={(e) => (setTo(e.target.value), setPage(1))} />
         {(group || user || from || to) && (
           <button className="btn btn-ghost btn-sm" onClick={reset(() => (setGroup(''), setUser(''), setFrom(''), setTo('')))}>
             {t('clearFilters')}

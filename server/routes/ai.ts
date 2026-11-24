@@ -42,7 +42,8 @@ aiRouter.post(
     if (!aiEnabled()) throw new HttpError(503, 'The assistant is not switched on. Use the form to start a project.');
     // The departments this person may start a project in: the same rule as creating one by hand.
     const { rows: deps } = await db.query('SELECT id, name, name_ar, head_user_id FROM departments ORDER BY color_slot, name');
-    const all = can(req, 'projects.edit_all') || can(req, 'projects.assign');
+    // A project manager starts a plan project nobody has started yet, in any department (the create checks the plan project).
+    const all = can(req, 'projects.edit_all') || can(req, 'projects.assign') || can(req, 'projects.start_plan');
     const allowed = deps
       .filter((d) => all || (can(req, 'projects.create') && d.head_user_id === req.user!.id))
       .map((d) => ({ id: d.id as number, name: d.name as string, nameAr: (d.name_ar as string) ?? '' }));

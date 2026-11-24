@@ -15,6 +15,7 @@ import {
 } from '@phosphor-icons/react';
 import type { Health, User } from '../../shared/types';
 import { useT } from '../lib/i18n';
+import { confirmLeave, useUnsaved } from '../lib/unsaved';
 import { initials } from '../lib/format';
 
 export const deptColor = (slot: number | undefined) => `var(--d${((slot ?? 1) - 1) % 8 + 1})`;
@@ -155,12 +156,33 @@ export function Dialog({
   // Callers pass an inline onClose, a new function on every render. Keeping it
   // in a ref lets the focus effect run once on open: re-running it on each
   // keystroke threw focus back to the first field.
-  const closeRef = useLatest(onClose);
+  const [dirty, setDirty] = useState(false);
+  useEffect(() => {
+    const el = ref.current;
+    const typed = () => setDirty(true);
+    const saved = () => setDirty(false);
+    el?.addEventListener('input', typed);
+    window.addEventListener('pmo:saved', saved);
+    return () => {
+      el?.removeEventListener('input', typed);
+      window.removeEventListener('pmo:saved', saved);
+    };
+  }, []);
+  const guard = useUnsaved(dirty, typeof title === 'string' ? title : t('thisForm'));
+  const closeRef = useLatest(async () => {
+    if (await confirmLeave(guard)) onClose();
+  });
   useEffect(() => {
     const prev = document.activeElement as HTMLElement | null;
     const first = ref.current?.querySelector<HTMLElement>('input:not(:disabled), select:not(:disabled), textarea:not(:disabled), button:not(.dialog-x)');
     first?.focus();
-    const onKey = (e: KeyboardEvent) => e.key === 'Escape' && closeRef.current();
+    // Esc closes the popup on top only.
+    const onKey = (e: KeyboardEvent) => {
+      // A guided tour open on top takes Esc for itself.
+      if (e.key !== 'Escape' || document.querySelector('.tour')) return;
+      const all = document.querySelectorAll('.dialog');
+      if (all[all.length - 1] === ref.current) closeRef.current();
+    };
     window.addEventListener('keydown', onKey);
     return () => {
       window.removeEventListener('keydown', onKey);
@@ -169,11 +191,11 @@ export function Dialog({
   }, [closeRef]);
   // At the top of the page, like the drawer, so where it is opened from never decides what covers it.
   return createPortal(
-    <div className="scrim" onMouseDown={(e) => e.target === e.currentTarget && onClose()}>
+    <div className="scrim" onMouseDown={(e) => e.target === e.currentTarget && closeRef.current()}>
       <div className="dialog" role="dialog" aria-modal="true" ref={ref} style={width ? { width: `min(${width}px, 100%)` } : undefined}>
         <div className="dialog-head">
           <h2 className="dialog-title">{title}</h2>
-          <button className="btn btn-ghost btn-icon btn-sm dialog-x" onClick={onClose} aria-label={t('close')}>
+          <button className="btn btn-ghost btn-icon btn-sm dialog-x" onClick={() => closeRef.current()} aria-label={t('close')}>
             <X size={16} />
           </button>
         </div>
@@ -188,7 +210,8 @@ export function Dialog({
 export function Drawer({ onClose, children, label }: { onClose: () => void; children: ReactNode; label: string }) {
   const closeRef = useLatest(onClose);
   useEffect(() => {
-    const onKey = (e: KeyboardEvent) => e.key === 'Escape' && closeRef.current();
+    // A popup open over the drawer takes Esc for itself.
+    const onKey = (e: KeyboardEvent) => e.key === 'Escape' && !document.querySelector('.scrim, .tour') && closeRef.current();
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
   }, [closeRef]);

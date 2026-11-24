@@ -64,6 +64,14 @@ export async function seedReference(): Promise<void> {
         WHERE id = 'pm'`,
     );
   }
+  // Project managers start the plan projects nobody has started yet (2026-11). Done once, like the change above.
+  const { rows: planStart } = await db.query(`INSERT INTO schema_flags (name) OUTPUT INSERTED.name SELECT 'pm-start-plan-1' WHERE NOT EXISTS (SELECT 1 FROM schema_flags WHERE name = 'pm-start-plan-1')`);
+  if (planStart.length) {
+    await db.query(
+      `UPDATE roles SET permissions = JSON_MODIFY(permissions, 'append $', 'projects.start_plan')
+        WHERE id = 'pm' AND NOT EXISTS (SELECT 1 FROM OPENJSON(permissions) WHERE value = 'projects.start_plan')`,
+    );
+  }
   // A department head named in the tracker is linked to the account of the same name, once and only when
   // exactly one account has it. After that the Departments tab is where it is chosen.
   const { rows: link } = await db.query(`INSERT INTO schema_flags (name) OUTPUT INSERTED.name SELECT 'dept-head-link-1' WHERE NOT EXISTS (SELECT 1 FROM schema_flags WHERE name = 'dept-head-link-1')`);

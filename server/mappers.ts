@@ -27,12 +27,18 @@ export function mapUser(r: any): User {
     name: r.name,
     roleId: r.role_id,
     title: r.title ?? null,
+    aiPaused: Boolean(r.ai_paused),
+    tourDone: Boolean(r.tour_done_at),
+    toursSeen: (r.tours_seen as string[] | null) ?? [],
+    awayUntil: r.away_until ? (r.away_until instanceof Date ? r.away_until.toISOString().slice(0, 10) : String(r.away_until).slice(0, 10)) : null,
     departmentId: r.department_id ?? null,
     active: r.active,
     pending: Boolean(r.must_set_password || r.temp_password),
     inviteExpiresAt: r.must_set_password && r.invite_expires_at ? iso(r.invite_expires_at) : null,
     inviteIssuedBy: r.must_set_password ? (r.invite_issued_by ?? null) : null,
     lastLoginAt: r.last_login_at ? iso(r.last_login_at) : null,
+    /** False while the account's setup email has not gone out (held until launch). */
+    setupEmailed: r.setup_emailed_at !== undefined ? r.setup_emailed_at !== null : undefined,
     owner: String(r.email).toLowerCase() === (process.env.OWNER_EMAIL ?? '').trim().toLowerCase(),
     systemAdmin:
       Boolean(r.is_system_admin) ||
@@ -84,6 +90,8 @@ export function mapQuarter(r: any): Quarter {
 
 export function mapProject(r: any): Project {
   return {
+    aiPmEnabled: Boolean(r.ai_pm_enabled),
+    aiPmSince: r.ai_pm_since ? new Date(r.ai_pm_since).toISOString() : null,
     id: r.id,
     initiativeId: r.initiative_id ?? null,
     code: r.code,
@@ -98,6 +106,13 @@ export function mapProject(r: any): Project {
     gate: r.gate ?? null,
     successMetric: r.success_metric ?? null,
     successTarget: r.success_target ?? null,
+    problemStatement: r.problem_statement ?? null,
+    stakeholders: r.stakeholders ?? null,
+    businessCase: r.business_case ?? null,
+    resources: r.resources ?? null,
+    riskPlan: r.risk_plan ?? null,
+    deliverables: r.deliverables ?? null,
+    acceptanceCriteria: r.acceptance_criteria ?? null,
     sponsor: r.sponsor ?? null,
     quarterId: r.quarter_id ?? null,
     priority: r.priority,
@@ -107,6 +122,8 @@ export function mapProject(r: any): Project {
     endDate: r.end_date,
     baselineStart: r.baseline_start ?? null,
     baselineEnd: r.baseline_end ?? null,
+    baselineFinish: r.plan_baseline_end ?? r.baseline_end ?? null,
+    baselineSlip: r.plan_slip !== undefined && r.plan_slip !== null ? Number(r.plan_slip) : null,
     progress: r.progress,
     budget: num(r.budget),
     blocker: r.blocker ?? null,
@@ -136,6 +153,7 @@ export function mapTask(r: any): Task {
     assigneeId: r.assignee_id ?? null,
     sort: r.sort,
     notes: r.notes ?? null,
+    systemKey: r.system_key ?? null,
     ownerName: r.owner_name ?? null,
     coOwners: r.co_owners ?? null,
     responsibleDept: r.responsible_dept ?? null,
@@ -156,11 +174,18 @@ export function mapDependency(r: any): Dependency {
 export function mapNote(r: any): MeetingNote {
   return {
     id: r.id,
-    updateId: r.update_id,
+    updateId: r.update_id ?? null,
     kind: r.kind,
     body: r.body,
     authorId: r.author_id ?? null,
     createdAt: iso(r.created_at),
+    projectId: r.project_id ?? null,
+    week: r.week_start ?? null,
+    ownerId: r.owner_id ?? null,
+    dueDate: r.due_date ?? null,
+    doneAt: r.done_at ? iso(r.done_at) : null,
+    ...(r.author_name !== undefined ? { authorName: r.author_name } : {}),
+    ...(r.owner_name !== undefined ? { ownerName: r.owner_name } : {}),
   };
 }
 

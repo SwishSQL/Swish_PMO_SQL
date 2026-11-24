@@ -7,6 +7,7 @@ import { fmtDateTime, projectName } from '../lib/format';
 import { stagger } from '../lib/motion';
 import { Dialog, Field } from './ui';
 import { DeliveryDoc } from './DeliveryDoc';
+import { MentionTextarea } from './MentionTextarea';
 
 interface Pending {
   id: number;
@@ -108,7 +109,7 @@ export function ClosureQueue() {
           }
         >
           <Field label={t('closureDecisionNote')}>
-            <textarea className="input" rows={4} value={note} onChange={(e) => setNote(e.target.value)} />
+            <MentionTextarea className="input" rows={4} value={note} onChange={(e) => setNote(e.target.value)} />
           </Field>
         </Dialog>
       )}

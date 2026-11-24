@@ -498,12 +498,264 @@ CREATE TABLE dbo.holidays (
 );
 GO
 
+-- A milestone the system keeps in every plan (closure_docs: the documents that prove the project is done).
+IF COL_LENGTH(N'dbo.tasks', N'system_key') IS NULL ALTER TABLE dbo.tasks ADD system_key NVARCHAR(450) NULL;
+GO
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = N'tasks_system_key_idx' AND object_id = OBJECT_ID(N'dbo.tasks'))
+CREATE UNIQUE INDEX tasks_system_key_idx ON dbo.tasks(project_id, system_key) WHERE system_key IS NOT NULL;
+GO
+
+-- A change asked for by email, waiting for the person to reply YES (then done through the normal API, as them).
+IF OBJECT_ID(N'dbo.email_actions', N'U') IS NULL
+CREATE TABLE dbo.email_actions (
+  id          INT IDENTITY(1,1) NOT NULL CONSTRAINT pk_email_actions PRIMARY KEY,
+  user_id     INT NOT NULL CONSTRAINT fk_email_actions_user FOREIGN KEY REFERENCES dbo.users(id),
+  project_id  INT NULL,
+  summary     NVARCHAR(MAX) NOT NULL,
+  request     NVARCHAR(MAX) NOT NULL CONSTRAINT ck_email_actions_request CHECK (ISJSON(request) = 1),
+  created_at  DATETIMEOFFSET(3) NOT NULL CONSTRAINT df_email_actions_created DEFAULT SYSDATETIMEOFFSET(),
+  done_at     DATETIMEOFFSET(3) NULL,
+  result      NVARCHAR(MAX) NULL
+);
+GO
+-- A proposal made in test mode (to the test address): approving it changes nothing.
+IF COL_LENGTH(N'dbo.email_actions', N'test') IS NULL ALTER TABLE dbo.email_actions ADD test BIT NOT NULL CONSTRAINT df_email_actions_test DEFAULT 0;
+GO
+
+-- The daily follow-up agent: each milestone asked about, to whom and why (spaces the reminders, counts them).
+IF OBJECT_ID(N'dbo.followups', N'U') IS NULL
+CREATE TABLE dbo.followups (
+  id       INT IDENTITY(1,1) NOT NULL CONSTRAINT pk_followups PRIMARY KEY,
+  task_id  INT NOT NULL CONSTRAINT fk_followups_task FOREIGN KEY REFERENCES dbo.tasks(id),
+  user_id  INT NULL CONSTRAINT fk_followups_user FOREIGN KEY REFERENCES dbo.users(id),
+  sent_to  NVARCHAR(MAX) NOT NULL,
+  reason   NVARCHAR(MAX) NOT NULL,
+  sent_on  DATE NOT NULL,
+  sent_at  DATETIMEOFFSET(3) NOT NULL CONSTRAINT df_followups_sent_at DEFAULT SYSDATETIMEOFFSET()
+);
+GO
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = N'followups_task' AND object_id = OBJECT_ID(N'dbo.followups'))
+CREATE INDEX followups_task ON dbo.followups(task_id, sent_on);
+GO
+-- Test-mode follow-ups (sent to the test address) are kept apart: they never count for the real owners.
+IF COL_LENGTH(N'dbo.followups', N'test') IS NULL ALTER TABLE dbo.followups ADD test BIT NOT NULL CONSTRAINT df_followups_test DEFAULT 0;
+GO
+
+-- Scheduled jobs that run once a day: one row per job and day, so a restart or a second server does not repeat it.
+IF OBJECT_ID(N'dbo.job_runs', N'U') IS NULL
+CREATE TABLE dbo.job_runs (
+  [key]   NVARCHAR(450) NOT NULL CONSTRAINT pk_job_runs PRIMARY KEY,
+  ran_at  DATETIMEOFFSET(3) NOT NULL CONSTRAINT df_job_runs_ran DEFAULT SYSDATETIMEOFFSET()
+);
+GO
+
+-- The weekly AI recommendations on a project: when, to whom, and the proposal they became.
+IF OBJECT_ID(N'dbo.recommendations', N'U') IS NULL
+CREATE TABLE dbo.recommendations (
+  id          INT IDENTITY(1,1) NOT NULL CONSTRAINT pk_recommendations PRIMARY KEY,
+  project_id  INT NOT NULL CONSTRAINT fk_recommendations_project FOREIGN KEY REFERENCES dbo.projects(id),
+  sent_to     NVARCHAR(MAX) NOT NULL,
+  action_id   INT NULL CONSTRAINT fk_recommendations_action FOREIGN KEY REFERENCES dbo.email_actions(id),
+  sent_on     DATE NOT NULL,
+  test        BIT NOT NULL CONSTRAINT df_recommendations_test DEFAULT 0
+);
+GO
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = N'recommendations_project' AND object_id = OBJECT_ID(N'dbo.recommendations'))
+CREATE INDEX recommendations_project ON dbo.recommendations(project_id, sent_on);
+GO
+
+-- Five stages (Monitoring & Control added, Closed folded into Closure: a finished project is Closure + health done).
+IF EXISTS (SELECT 1 FROM sys.check_constraints WHERE name = N'ck_projects_stage' AND parent_object_id = OBJECT_ID(N'dbo.projects') AND definition LIKE N'%closed%')
+  ALTER TABLE dbo.projects DROP CONSTRAINT ck_projects_stage;
+GO
+UPDATE dbo.projects SET stage = N'closure', health = N'done' WHERE stage = N'closed';
+GO
+IF NOT EXISTS (SELECT 1 FROM sys.check_constraints WHERE name = N'ck_projects_stage' AND parent_object_id = OBJECT_ID(N'dbo.projects'))
+  ALTER TABLE dbo.projects ADD CONSTRAINT ck_projects_stage CHECK (stage IN (N'initiation', N'planning', N'execution', N'monitoring', N'closure'));
+GO
+
+-- What each stage states when the project is created (shared/stageRequirements.ts).
+IF COL_LENGTH(N'dbo.projects', N'problem_statement') IS NULL ALTER TABLE dbo.projects ADD problem_statement NVARCHAR(MAX) NULL;
+IF COL_LENGTH(N'dbo.projects', N'stakeholders') IS NULL ALTER TABLE dbo.projects ADD stakeholders NVARCHAR(MAX) NULL;
+IF COL_LENGTH(N'dbo.projects', N'business_case') IS NULL ALTER TABLE dbo.projects ADD business_case NVARCHAR(MAX) NULL;
+IF COL_LENGTH(N'dbo.projects', N'resources') IS NULL ALTER TABLE dbo.projects ADD resources NVARCHAR(MAX) NULL;
+IF COL_LENGTH(N'dbo.projects', N'risk_plan') IS NULL ALTER TABLE dbo.projects ADD risk_plan NVARCHAR(MAX) NULL;
+IF COL_LENGTH(N'dbo.projects', N'deliverables') IS NULL ALTER TABLE dbo.projects ADD deliverables NVARCHAR(MAX) NULL;
+IF COL_LENGTH(N'dbo.projects', N'acceptance_criteria') IS NULL ALTER TABLE dbo.projects ADD acceptance_criteria NVARCHAR(MAX) NULL;
+GO
+
+-- Meeting notes belong to the project and week (an update may not be filed); an action has an owner and a due date.
+IF EXISTS (SELECT 1 FROM sys.columns WHERE object_id = OBJECT_ID(N'dbo.meeting_notes') AND name = N'update_id' AND is_nullable = 0)
+  ALTER TABLE dbo.meeting_notes ALTER COLUMN update_id INT NULL;
+GO
+IF COL_LENGTH(N'dbo.meeting_notes', N'project_id') IS NULL ALTER TABLE dbo.meeting_notes ADD project_id INT NULL CONSTRAINT fk_meeting_notes_project FOREIGN KEY REFERENCES dbo.projects(id);
+IF COL_LENGTH(N'dbo.meeting_notes', N'week_start') IS NULL ALTER TABLE dbo.meeting_notes ADD week_start DATE NULL;
+IF COL_LENGTH(N'dbo.meeting_notes', N'owner_id') IS NULL ALTER TABLE dbo.meeting_notes ADD owner_id INT NULL CONSTRAINT fk_meeting_notes_owner FOREIGN KEY REFERENCES dbo.users(id);
+IF COL_LENGTH(N'dbo.meeting_notes', N'due_date') IS NULL ALTER TABLE dbo.meeting_notes ADD due_date DATE NULL;
+IF COL_LENGTH(N'dbo.meeting_notes', N'done_at') IS NULL ALTER TABLE dbo.meeting_notes ADD done_at DATETIMEOFFSET(3) NULL;
+GO
+-- A blocker on the whole project, raised in the meeting; open until cleared (done_at).
+IF EXISTS (SELECT 1 FROM sys.check_constraints WHERE name = N'ck_meeting_notes_kind' AND parent_object_id = OBJECT_ID(N'dbo.meeting_notes') AND definition NOT LIKE N'%decision_needed%')
+  ALTER TABLE dbo.meeting_notes DROP CONSTRAINT ck_meeting_notes_kind;
+GO
+IF NOT EXISTS (SELECT 1 FROM sys.check_constraints WHERE name = N'ck_meeting_notes_kind' AND parent_object_id = OBJECT_ID(N'dbo.meeting_notes'))
+  ALTER TABLE dbo.meeting_notes ADD CONSTRAINT ck_meeting_notes_kind CHECK (kind IN (N'comment', N'decision', N'action', N'blocker', N'decision_needed'));
+GO
+UPDATE n SET project_id = s.project_id, week_start = s.week_start
+  FROM dbo.meeting_notes n JOIN dbo.status_updates s ON s.id = n.update_id
+ WHERE n.project_id IS NULL;
+GO
+
+-- View as: a PMO admin's session may show the app as another person sees it, to test their journey. Nothing is
+-- saved while it is on (the server refuses every change).
+IF COL_LENGTH(N'dbo.sessions', N'view_as_user_id') IS NULL ALTER TABLE dbo.sessions ADD view_as_user_id INT NULL CONSTRAINT fk_sessions_view_as FOREIGN KEY REFERENCES dbo.users(id);
+GO
+
+-- When the account's setup email went out. Accounts can be made before launch and emailed later (one by one, or
+-- all at once). Accounts that already have a password, or were emailed before this column, count as sent.
+IF COL_LENGTH(N'dbo.users', N'setup_emailed_at') IS NULL ALTER TABLE dbo.users ADD setup_emailed_at DATETIMEOFFSET(3) NULL;
+GO
+
+-- Work given across departments waits for a decision: the other department's head picks or approves the person,
+-- a system admin creates the account of someone new. user_id NULL and no new_email means "the head picks".
+IF OBJECT_ID(N'dbo.owner_requests', N'U') IS NULL
+CREATE TABLE dbo.owner_requests (
+  id             INT IDENTITY(1,1) NOT NULL CONSTRAINT pk_owner_requests PRIMARY KEY,
+  task_id        INT NOT NULL CONSTRAINT fk_owner_requests_task FOREIGN KEY REFERENCES dbo.tasks(id),
+  department_id  INT NOT NULL CONSTRAINT fk_owner_requests_department FOREIGN KEY REFERENCES dbo.departments(id),
+  user_id        INT NULL CONSTRAINT fk_owner_requests_user FOREIGN KEY REFERENCES dbo.users(id),
+  new_name       NVARCHAR(MAX) NULL,
+  new_email      NVARCHAR(MAX) NULL,
+  requested_by   INT NULL CONSTRAINT fk_owner_requests_requested FOREIGN KEY REFERENCES dbo.users(id),
+  requested_at   DATETIMEOFFSET(3) NOT NULL CONSTRAINT df_owner_requests_requested DEFAULT SYSDATETIMEOFFSET(),
+  status         NVARCHAR(50) NOT NULL CONSTRAINT df_owner_requests_status DEFAULT N'pending',
+  decided_by     INT NULL CONSTRAINT fk_owner_requests_decided FOREIGN KEY REFERENCES dbo.users(id),
+  decided_at     DATETIMEOFFSET(3) NULL,
+  note           NVARCHAR(MAX) NULL
+);
+GO
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = N'owner_requests_pending' AND object_id = OBJECT_ID(N'dbo.owner_requests'))
+CREATE INDEX owner_requests_pending ON dbo.owner_requests(task_id) WHERE status = N'pending';
+GO
+
+-- The staff directory (org chart): everyone, with or without an account, their department, position and direct
+-- manager. An account is linked to its person by email.
+IF OBJECT_ID(N'dbo.staff', N'U') IS NULL
+CREATE TABLE dbo.staff (
+  id             INT IDENTITY(1,1) NOT NULL CONSTRAINT pk_staff PRIMARY KEY,
+  emp_no         NVARCHAR(450) NULL,
+  name           NVARCHAR(MAX) NOT NULL,
+  email          NVARCHAR(450) NULL,
+  department_id  INT NULL CONSTRAINT fk_staff_department FOREIGN KEY REFERENCES dbo.departments(id),
+  position       NVARCHAR(MAX) NULL,
+  manager_id     INT NULL CONSTRAINT fk_staff_manager FOREIGN KEY REFERENCES dbo.staff(id),
+  active         BIT NOT NULL CONSTRAINT df_staff_active DEFAULT 1,
+  updated_at     DATETIMEOFFSET(3) NOT NULL CONSTRAINT df_staff_updated DEFAULT SYSDATETIMEOFFSET()
+);
+GO
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = N'staff_emp_no_idx' AND object_id = OBJECT_ID(N'dbo.staff'))
+CREATE UNIQUE INDEX staff_emp_no_idx ON dbo.staff(emp_no) WHERE emp_no IS NOT NULL;
+GO
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = N'staff_email' AND object_id = OBJECT_ID(N'dbo.staff'))
+CREATE INDEX staff_email ON dbo.staff(email);
+GO
+-- Board of Directors: a member's title on the board (Chairman, Vice Chairman, Board Member) and their order.
+IF COL_LENGTH(N'dbo.staff', N'board_title') IS NULL ALTER TABLE dbo.staff ADD board_title NVARCHAR(MAX) NULL;
+IF COL_LENGTH(N'dbo.staff', N'board_rank') IS NULL ALTER TABLE dbo.staff ADD board_rank INT NULL;
+GO
+
+-- Portfolios (capabilities) and programs (dimensions) have a manager who watches the projects under them.
+IF COL_LENGTH(N'dbo.capabilities', N'manager_user_id') IS NULL ALTER TABLE dbo.capabilities ADD manager_user_id INT NULL CONSTRAINT fk_capabilities_manager FOREIGN KEY REFERENCES dbo.users(id);
+IF COL_LENGTH(N'dbo.dimensions', N'manager_user_id') IS NULL ALTER TABLE dbo.dimensions ADD manager_user_id INT NULL CONSTRAINT fk_dimensions_manager FOREIGN KEY REFERENCES dbo.users(id);
+GO
+-- The named steps at the top of the escalation ladder: 'ibe' (Integrated Business Excellence) and 'ceo'.
+IF OBJECT_ID(N'dbo.ladder_roles', N'U') IS NULL
+CREATE TABLE dbo.ladder_roles (
+  [key]    NVARCHAR(450) NOT NULL CONSTRAINT pk_ladder_roles PRIMARY KEY,
+  user_id  INT NULL CONSTRAINT fk_ladder_roles_user FOREIGN KEY REFERENCES dbo.users(id)
+);
+GO
+
+-- The AI project manager, switched on per project; what it does is logged. People can be paused or away.
+IF COL_LENGTH(N'dbo.projects', N'ai_pm_enabled') IS NULL ALTER TABLE dbo.projects ADD ai_pm_enabled BIT NOT NULL CONSTRAINT df_projects_ai_pm DEFAULT 0;
+IF COL_LENGTH(N'dbo.projects', N'ai_pm_since') IS NULL ALTER TABLE dbo.projects ADD ai_pm_since DATETIMEOFFSET(3) NULL;
+IF COL_LENGTH(N'dbo.projects', N'ai_pm_by') IS NULL ALTER TABLE dbo.projects ADD ai_pm_by INT NULL CONSTRAINT fk_projects_ai_pm_by FOREIGN KEY REFERENCES dbo.users(id);
+IF COL_LENGTH(N'dbo.users', N'ai_paused') IS NULL ALTER TABLE dbo.users ADD ai_paused BIT NOT NULL CONSTRAINT df_users_ai_paused DEFAULT 0;
+IF COL_LENGTH(N'dbo.users', N'away_until') IS NULL ALTER TABLE dbo.users ADD away_until DATE NULL;
+-- When the person finished (or skipped) the guided tour: it opens by itself only before that.
+IF COL_LENGTH(N'dbo.users', N'tour_done_at') IS NULL ALTER TABLE dbo.users ADD tour_done_at DATETIMEOFFSET(3) NULL;
+-- The page tours the person has finished or skipped (a JSON list of names): each opens by itself only before that.
+IF COL_LENGTH(N'dbo.users', N'tours_seen') IS NULL ALTER TABLE dbo.users ADD tours_seen NVARCHAR(MAX) NOT NULL CONSTRAINT df_users_tours_seen DEFAULT N'[]' CONSTRAINT ck_users_tours_seen CHECK (ISJSON(tours_seen) = 1);
+GO
+IF OBJECT_ID(N'dbo.ai_pm_log', N'U') IS NULL
+CREATE TABLE dbo.ai_pm_log (
+  id          INT IDENTITY(1,1) NOT NULL CONSTRAINT pk_ai_pm_log PRIMARY KEY,
+  project_id  INT NOT NULL CONSTRAINT fk_ai_pm_log_project FOREIGN KEY REFERENCES dbo.projects(id),
+  task_id     INT NULL CONSTRAINT fk_ai_pm_log_task FOREIGN KEY REFERENCES dbo.tasks(id),
+  user_id     INT NULL CONSTRAINT fk_ai_pm_log_user FOREIGN KEY REFERENCES dbo.users(id),
+  action      NVARCHAR(MAX) NOT NULL,
+  message     NVARCHAR(MAX) NOT NULL,
+  created_at  DATETIMEOFFSET(3) NOT NULL CONSTRAINT df_ai_pm_log_created DEFAULT SYSDATETIMEOFFSET()
+);
+GO
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = N'ai_pm_log_project' AND object_id = OBJECT_ID(N'dbo.ai_pm_log'))
+CREATE INDEX ai_pm_log_project ON dbo.ai_pm_log(project_id, created_at DESC);
+GO
+
+-- A project that waits for others to close before it starts. started_before: it was already under way when linked
+-- (shown, not frozen).
+IF OBJECT_ID(N'dbo.project_dependencies', N'U') IS NULL
+CREATE TABLE dbo.project_dependencies (
+  project_id      INT NOT NULL CONSTRAINT fk_project_dependencies_project FOREIGN KEY REFERENCES dbo.projects(id),
+  depends_on_id   INT NOT NULL CONSTRAINT fk_project_dependencies_depends FOREIGN KEY REFERENCES dbo.projects(id),
+  started_before  BIT NOT NULL CONSTRAINT df_project_dependencies_started DEFAULT 0,
+  created_by      INT NULL CONSTRAINT fk_project_dependencies_by FOREIGN KEY REFERENCES dbo.users(id),
+  created_at      DATETIMEOFFSET(3) NOT NULL CONSTRAINT df_project_dependencies_created DEFAULT SYSDATETIMEOFFSET(),
+  CONSTRAINT pk_project_dependencies PRIMARY KEY (project_id, depends_on_id),
+  CONSTRAINT ck_project_dependencies_self CHECK (project_id <> depends_on_id)
+);
+GO
+
+-- Files attached to a milestone or task: any kind, kept in the database, always served as a download.
+IF OBJECT_ID(N'dbo.task_attachments', N'U') IS NULL
+CREATE TABLE dbo.task_attachments (
+  id           INT IDENTITY(1,1) NOT NULL CONSTRAINT pk_task_attachments PRIMARY KEY,
+  task_id      INT NOT NULL CONSTRAINT fk_task_attachments_task FOREIGN KEY REFERENCES dbo.tasks(id),
+  name         NVARCHAR(MAX) NOT NULL,
+  size         INT NOT NULL,
+  data         VARBINARY(MAX) NOT NULL,
+  uploaded_by  INT NULL CONSTRAINT fk_task_attachments_by FOREIGN KEY REFERENCES dbo.users(id),
+  created_at   DATETIMEOFFSET(3) NOT NULL CONSTRAINT df_task_attachments_created DEFAULT SYSDATETIMEOFFSET()
+);
+GO
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = N'task_attachments_task' AND object_id = OBJECT_ID(N'dbo.task_attachments'))
+CREATE INDEX task_attachments_task ON dbo.task_attachments(task_id);
+GO
+
+-- Team roles come from a fixed list (shared/types.ts TEAM_ROLES). The owner is the Project manager, nobody else.
+UPDATE m SET role = N'Member'
+  FROM dbo.project_members m
+ WHERE role NOT IN (N'Project manager', N'Team lead', N'Member', N'Subject matter expert', N'Stakeholder / Reviewer', N'PMO coordinator')
+    OR (role = N'Project manager' AND NOT EXISTS (SELECT 1 FROM dbo.projects p WHERE p.id = m.project_id AND p.manager_id = m.user_id));
+GO
+UPDATE m SET role = N'Project manager'
+  FROM dbo.project_members m JOIN dbo.projects p ON p.id = m.project_id
+ WHERE p.manager_id = m.user_id AND m.role <> N'Project manager';
+GO
+
 -- The imported tracker comment becomes the first row of each history, once (no author: it came from the import).
 INSERT INTO dbo.milestone_updates (task_id, created_at, status, progress, comment, blocker)
 SELECT t.id, DATEADD(HOUR, 12, CAST(COALESCE(t.update_comment_on, t.last_update_on, CAST(SYSUTCDATETIME() AS DATE)) AS DATETIMEOFFSET(3))), t.status, t.progress, t.update_comment, t.blocker
   FROM dbo.tasks t
  WHERE t.update_comment IS NOT NULL
    AND NOT EXISTS (SELECT 1 FROM dbo.milestone_updates m WHERE m.task_id = t.id);
+GO
+
+UPDATE u SET setup_emailed_at = COALESCE(u.password_set_at, SYSDATETIMEOFFSET())
+  FROM dbo.users u
+ WHERE u.setup_emailed_at IS NULL
+   AND (u.password_hash IS NOT NULL OR EXISTS (SELECT 1 FROM dbo.activity a WHERE a.action = N'user.setup_emailed' AND JSON_VALUE(a.detail, '$.email') = u.email))
+   AND NOT EXISTS (SELECT 1 FROM dbo.activity a WHERE a.action = N'user.created' AND JSON_VALUE(a.detail, '$.held') = N'true' AND JSON_VALUE(a.detail, '$.email') = u.email);
 GO
 
 -- ---------------------------------------------------------------------------------------------------------------
@@ -528,6 +780,10 @@ BEGIN
   DELETE FROM dbo.escalations WHERE task_id IN (SELECT id FROM @ids);
   DELETE FROM dbo.task_coowners WHERE task_id IN (SELECT id FROM @ids);
   DELETE FROM dbo.notifications WHERE task_id IN (SELECT id FROM @ids);
+  DELETE FROM dbo.followups WHERE task_id IN (SELECT id FROM @ids);
+  DELETE FROM dbo.owner_requests WHERE task_id IN (SELECT id FROM @ids);
+  DELETE FROM dbo.task_attachments WHERE task_id IN (SELECT id FROM @ids);
+  UPDATE dbo.ai_pm_log SET task_id = NULL WHERE task_id IN (SELECT id FROM @ids);
   DELETE FROM dbo.tasks WHERE id IN (SELECT id FROM @ids);
 END;
 GO
@@ -552,6 +808,10 @@ BEGIN
   DELETE FROM dbo.notifications WHERE project_id IN (SELECT id FROM deleted);
   DELETE FROM dbo.closure_requests WHERE project_id IN (SELECT id FROM deleted);
   DELETE FROM dbo.change_requests WHERE project_id IN (SELECT id FROM deleted);
+  DELETE FROM dbo.recommendations WHERE project_id IN (SELECT id FROM deleted);
+  DELETE FROM dbo.meeting_notes WHERE project_id IN (SELECT id FROM deleted);
+  DELETE FROM dbo.ai_pm_log WHERE project_id IN (SELECT id FROM deleted);
+  DELETE FROM dbo.project_dependencies WHERE project_id IN (SELECT id FROM deleted) OR depends_on_id IN (SELECT id FROM deleted);
   DELETE FROM dbo.projects WHERE id IN (SELECT id FROM deleted);
 END;
 GO
@@ -565,6 +825,20 @@ BEGIN
   DELETE FROM dbo.task_coowners WHERE user_id IN (SELECT id FROM deleted);
   DELETE FROM dbo.notifications WHERE user_id IN (SELECT id FROM deleted);
   DELETE FROM dbo.email_sent WHERE user_id IN (SELECT id FROM deleted);
+  DELETE FROM dbo.email_actions WHERE user_id IN (SELECT id FROM deleted);
+  UPDATE dbo.sessions SET view_as_user_id = NULL WHERE view_as_user_id IN (SELECT id FROM deleted);
+  UPDATE dbo.followups SET user_id = NULL WHERE user_id IN (SELECT id FROM deleted);
+  UPDATE dbo.owner_requests SET user_id = NULL WHERE user_id IN (SELECT id FROM deleted);
+  UPDATE dbo.owner_requests SET requested_by = NULL WHERE requested_by IN (SELECT id FROM deleted);
+  UPDATE dbo.owner_requests SET decided_by = NULL WHERE decided_by IN (SELECT id FROM deleted);
+  UPDATE dbo.capabilities SET manager_user_id = NULL WHERE manager_user_id IN (SELECT id FROM deleted);
+  UPDATE dbo.dimensions SET manager_user_id = NULL WHERE manager_user_id IN (SELECT id FROM deleted);
+  UPDATE dbo.ladder_roles SET user_id = NULL WHERE user_id IN (SELECT id FROM deleted);
+  UPDATE dbo.projects SET ai_pm_by = NULL WHERE ai_pm_by IN (SELECT id FROM deleted);
+  UPDATE dbo.ai_pm_log SET user_id = NULL WHERE user_id IN (SELECT id FROM deleted);
+  UPDATE dbo.meeting_notes SET owner_id = NULL WHERE owner_id IN (SELECT id FROM deleted);
+  UPDATE dbo.project_dependencies SET created_by = NULL WHERE created_by IN (SELECT id FROM deleted);
+  UPDATE dbo.task_attachments SET uploaded_by = NULL WHERE uploaded_by IN (SELECT id FROM deleted);
   UPDATE dbo.users SET invite_issued_by = NULL WHERE invite_issued_by IN (SELECT id FROM deleted);
   UPDATE dbo.users SET password_link_by = NULL WHERE password_link_by IN (SELECT id FROM deleted);
   UPDATE dbo.departments SET head_user_id = NULL WHERE head_user_id IN (SELECT id FROM deleted);
@@ -594,7 +868,25 @@ CREATE OR ALTER TRIGGER dbo.trg_departments_delete ON dbo.departments INSTEAD OF
 BEGIN
   SET NOCOUNT ON;
   UPDATE dbo.users SET department_id = NULL WHERE department_id IN (SELECT id FROM deleted);
+  UPDATE dbo.staff SET department_id = NULL WHERE department_id IN (SELECT id FROM deleted);
+  DELETE FROM dbo.owner_requests WHERE department_id IN (SELECT id FROM deleted);
   DELETE FROM dbo.departments WHERE id IN (SELECT id FROM deleted);
+END;
+GO
+
+CREATE OR ALTER TRIGGER dbo.trg_staff_delete ON dbo.staff INSTEAD OF DELETE AS
+BEGIN
+  SET NOCOUNT ON;
+  UPDATE dbo.staff SET manager_id = NULL WHERE manager_id IN (SELECT id FROM deleted);
+  DELETE FROM dbo.staff WHERE id IN (SELECT id FROM deleted);
+END;
+GO
+
+CREATE OR ALTER TRIGGER dbo.trg_email_actions_delete ON dbo.email_actions INSTEAD OF DELETE AS
+BEGIN
+  SET NOCOUNT ON;
+  UPDATE dbo.recommendations SET action_id = NULL WHERE action_id IN (SELECT id FROM deleted);
+  DELETE FROM dbo.email_actions WHERE id IN (SELECT id FROM deleted);
 END;
 GO
 

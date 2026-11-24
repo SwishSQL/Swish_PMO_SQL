@@ -11,7 +11,8 @@ export const notificationsRouter = Router();
 notificationsRouter.get(
   '/notifications/count',
   route(async (req, res) => {
-    await ensureReminders(req.user!.id);
+    // Viewing as someone makes nothing for them, not even their daily reminders.
+    if (!req.realUser) await ensureReminders(req.user!.id);
     const { rows } = await db.query('SELECT COUNT(*) AS n FROM notifications WHERE user_id = $1 AND read_at IS NULL', [req.user!.id]);
     res.json({ unread: rows[0].n });
   }),

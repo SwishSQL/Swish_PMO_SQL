@@ -7,8 +7,12 @@ import { useApp } from '../lib/app';
 import { useT } from '../lib/i18n';
 import { deptName } from '../lib/format';
 import { Dialog, Field } from './ui';
-import { PhasePicker } from './PhasePicker';
 import { PROJECT_PHASES } from '../../shared/phases';
+import { STAGE_FIELDS, missingForCreation } from '../../shared/stageRequirements';
+import { DateInput } from './DateInput';
+import type { ProjectPreset } from './NewProject';
+import { SponsorSelect } from './SponsorSelect';
+import { PeoplePicker } from './PeoplePicker';
 
 interface Turn {
   role: 'user' | 'assistant';
@@ -26,6 +30,16 @@ const EMPTY: ProjectDraft = {
   priority: 'medium',
   objective: '',
   scope: '',
+  problemStatement: '',
+  stakeholders: '',
+  businessCase: '',
+  budget: '',
+  resources: '',
+  riskPlan: '',
+  deliverables: '',
+  successMetric: '',
+  successTarget: '',
+  acceptanceCriteria: '',
   startDate: '',
   endDate: '',
   phases: [...PROJECT_PHASES],
@@ -37,12 +51,25 @@ const EMPTY: ProjectDraft = {
  * (name, department, owner, dates, milestones), and every field stays editable. Nothing exists until the person
  * presses Create, which goes through the normal creation with the normal rules.
  */
-export function AiProjectDialog({ onClose, onCreated }: { onClose: () => void; onCreated: (id: number) => void }) {
-  const { meta, quarterId, canCreateIn } = useApp();
+export function AiProjectDialog({ onClose, onCreated, preset }: { onClose: () => void; onCreated: (id: number) => void; preset?: ProjectPreset }) {
+  const { meta, quarterId, canCreateIn, can } = useApp();
   const { t, lang } = useT();
-  const allowed = meta.departments.filter((d) => canCreateIn(d.id));
+  // A project manager starts a plan project in any department, and runs it.
+  const planOnly = !meta.departments.some((d) => canCreateIn(d.id)) && can('projects.start_plan');
+  const allowed = planOnly ? meta.departments : meta.departments.filter((d) => canCreateIn(d.id));
   const [turns, setTurns] = useState<Turn[]>([]);
-  const [draft, setDraft] = useState<ProjectDraft>(EMPTY);
+  const [draft, setDraft] = useState<ProjectDraft>(() =>
+    preset
+      ? {
+          ...EMPTY,
+          name: preset.name,
+          objective: preset.objective ?? '',
+          successMetric: preset.successMetric ?? '',
+          successTarget: preset.successTarget ?? '',
+          acceptanceCriteria: preset.acceptanceCriteria ?? '',
+        }
+      : EMPTY,
+  );
   const [assumptions, setAssumptions] = useState<string[]>([]);
   const [text, setText] = useState('');
   const [busy, setBusy] = useState(false);
@@ -89,18 +116,28 @@ export function AiProjectDialog({ onClose, onCreated }: { onClose: () => void; o
     }
   };
 
+  // From a plan project: the assistant is told what the workbook says, once, and drafts from there.
+  const seeded = useRef(false);
+  useEffect(() => {
+    if (!preset || seeded.current) return;
+    seeded.current = true;
+    void send(`${t('aiFromPlan', { name: preset.name })}\n\n${preset.context ?? ''}`);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
   const datesOk = Boolean(draft.startDate && draft.endDate && draft.endDate >= draft.startDate);
   const milestonesOk = draft.milestones.every((m) => !m.name.trim() || m.date);
   const ready = Boolean(draft.name.trim() && draft.departmentId && datesOk && milestonesOk);
-  // What a complete project still lacks, checked here too so nothing is missed even if the assistant forgets to ask.
+  // What a complete project still lacks, by the same rules as the server, so nothing is missed even if the
+  // assistant forgets to ask; Create opens only when nothing is.
+  const stageMissing = missingForCreation({ ...draft, milestones: draft.milestones.filter((m) => m.name.trim()) }, lang === 'ar' ? 'ar' : 'en');
   const stillNeeded = [
     !draft.name.trim() && t('name'),
     !draft.departmentId && t('department'),
-    !draft.ownerId && t('manager'),
+    !planOnly && !draft.ownerId && t('manager'),
     !datesOk && `${t('start')} / ${t('finish')}`,
-    !draft.objective.trim() && t('objective'),
     !draft.sponsor.trim() && t('sponsor'),
-    draft.milestones.filter((m) => m.name.trim()).length === 0 && t('milestonesPage'),
+    ...stageMissing.map((m) => `${m.phase}: ${m.items.join(', ')}`),
   ].filter(Boolean) as string[];
 
   const create = async () => {
@@ -113,6 +150,7 @@ export function AiProjectDialog({ onClose, onCreated }: { onClose: () => void; o
         managerId: draft.ownerId || undefined,
         quarterId: quarterId ?? null,
         milestones: draft.milestones.filter((m) => m.name.trim() && m.date),
+        ...(preset ? { initiativeId: preset.initiativeId } : {}),
       });
       onCreated(detail.project.id);
     } catch (e) {
@@ -143,7 +181,7 @@ export function AiProjectDialog({ onClose, onCreated }: { onClose: () => void; o
           <button className="btn" onClick={onClose}>
             {t('cancel')}
           </button>
-          <button className="btn btn-primary" disabled={!ready || creating || busy} onClick={create}>
+          <button className="btn btn-primary" disabled={!ready || stillNeeded.length > 0 || creating || busy} onClick={create}>
             {t('aiCreateProject')}
           </button>
         </>
@@ -251,8 +289,8 @@ export function AiProjectDialog({ onClose, onCreated }: { onClose: () => void; o
                 ))}
               </select>
             </Field>
-            <Field label={t('manager')} hint={t('aiOwnerHint')}>
-              <select className="select" value={draft.ownerId || ''} onChange={(e) => set('ownerId', Number(e.target.value))}>
+            <Field label={t('manager')} hint={planOnly ? t('ownerIsYou') : t('aiOwnerHint')}>
+              <select className="select" value={planOnly ? meta.me.id : draft.ownerId || ''} disabled={planOnly} onChange={(e) => set('ownerId', Number(e.target.value))}>
                 <option value="">{t('aiOwnerDefault')}</option>
                 {meta.users
                   .filter((u) => u.active)
@@ -264,10 +302,10 @@ export function AiProjectDialog({ onClose, onCreated }: { onClose: () => void; o
               </select>
             </Field>
             <Field label={t('start')}>
-              <input className="input" type="date" value={draft.startDate} onChange={(e) => set('startDate', e.target.value)} />
+              <DateInput className="input" value={draft.startDate} onChange={(e) => set('startDate', e.target.value)} />
             </Field>
             <Field label={t('finish')} warn={draft.startDate && draft.endDate && draft.endDate < draft.startDate ? t('aiEndBeforeStart') : null}>
-              <input className="input" type="date" value={draft.endDate} min={draft.startDate || undefined} onChange={(e) => set('endDate', e.target.value)} />
+              <DateInput className="input" value={draft.endDate} min={draft.startDate || undefined} onChange={(e) => set('endDate', e.target.value)} />
             </Field>
             <Field label={t('priority')}>
               <select className="select" value={draft.priority} onChange={(e) => set('priority', e.target.value as ProjectDraft['priority'])}>
@@ -279,7 +317,7 @@ export function AiProjectDialog({ onClose, onCreated }: { onClose: () => void; o
               </select>
             </Field>
             <Field label={t('sponsor')}>
-              <input className="input" value={draft.sponsor} onChange={(e) => set('sponsor', e.target.value)} maxLength={120} dir="auto" />
+              <SponsorSelect value={draft.sponsor} onChange={(v) => set('sponsor', v)} />
             </Field>
             <Field label={t('objective')} className="span-2">
               <textarea className="input" rows={2} value={draft.objective} onChange={(e) => set('objective', e.target.value)} dir="auto" />
@@ -287,7 +325,22 @@ export function AiProjectDialog({ onClose, onCreated }: { onClose: () => void; o
           </div>
 
           <div className="form-grid" style={{ marginTop: 14 }}>
-            <PhasePicker value={draft.phases} onChange={(v) => set('phases', v)} />
+            {PROJECT_PHASES.map((phase) => (
+              <div key={phase} className="span-2" style={{ display: 'grid', gap: 10 }}>
+                <strong style={{ fontSize: 13 }}>{phase}</strong>
+                {STAGE_FIELDS[phase].map((f) => (
+                  <Field key={f.key} label={`${lang === 'ar' ? f.ar : f.en} *`}>
+                    {f.key === 'stakeholders' ? (
+                      <PeoplePicker label={lang === 'ar' ? f.ar : f.en} value={draft[f.key]} onChange={(v) => set(f.key, v)} />
+                    ) : f.number ? (
+                      <input className="input num" inputMode="decimal" value={draft[f.key]} onChange={(e) => set(f.key, e.target.value)} />
+                    ) : (
+                      <textarea className="input" rows={2} dir="auto" value={draft[f.key]} onChange={(e) => set(f.key, e.target.value)} />
+                    )}
+                  </Field>
+                ))}
+              </div>
+            ))}
           </div>
 
           <div className="ai-ms-head">
@@ -306,9 +359,8 @@ export function AiProjectDialog({ onClose, onCreated }: { onClose: () => void; o
                   maxLength={160}
                   onChange={(e) => set('milestones', draft.milestones.map((x, j) => (j === i ? { ...x, name: e.target.value } : x)))}
                 />
-                <input
+                <DateInput
                   className="input"
-                  type="date"
                   value={m.date}
                   aria-label={t('dueDate')}
                   min={draft.startDate || undefined}
@@ -321,8 +373,8 @@ export function AiProjectDialog({ onClose, onCreated }: { onClose: () => void; o
                   value={m.phase ?? ''}
                   onChange={(e) => set('milestones', draft.milestones.map((x, j) => (j === i ? { ...x, phase: e.target.value } : x)))}
                 >
-                  <option value="">{t('phaseByDate')}</option>
-                  {draft.phases.map((p) => (
+                  <option value="">{t('phaseChoose')}</option>
+                  {PROJECT_PHASES.map((p) => (
                     <option key={p} value={p}>
                       {p}
                     </option>

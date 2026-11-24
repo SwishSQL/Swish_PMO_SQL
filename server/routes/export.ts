@@ -2,10 +2,10 @@ import { Router } from 'express';
 import type { Response } from 'express';
 import type ExcelJS from 'exceljs';
 import { db } from '../db';
-import { HttpError, canViewProject, route, seesAllProjects } from '../auth';
+import { HttpError, can, canViewProject, route, seesAllProjects, seesProjectInternals } from '../auth';
 import { projectVisibleSql, taskVisibleSql } from '../visibility';
 import { idParam } from '../validate';
-import { listProjects } from '../service';
+import { listProjects, runProjectIds } from '../service';
 import { milestonesWorkbook, portfolioWorkbook, projectWorkbook, toBuffer } from '../export';
 import { todayIso } from '../../shared/dates';
 
@@ -34,7 +34,14 @@ exportRouter.get(
       if (!rows[0]) throw new HttpError(404, 'Quarter not found.');
       label = rows[0].code;
     }
-    await send(res, await portfolioWorkbook(projects.map((p) => p.id)), `swish-pmo-portfolio-${label}-${todayIso()}.xlsx`);
+    // The workbook carries budgets: outside the PMO and executives, only the projects the person runs.
+    let ids = projects.map((p) => p.id);
+    if (!can(req, 'projects.view_all') && !can(req, 'projects.edit_all')) {
+      const runs = await runProjectIds(req.user!.id);
+      ids = ids.filter((pid) => runs.has(pid));
+      if (!ids.length) throw new HttpError(403, 'The portfolio export is for project managers and the PMO.');
+    }
+    await send(res, await portfolioWorkbook(ids), `swish-pmo-portfolio-${label}-${todayIso()}.xlsx`);
   }),
 );
 
@@ -62,6 +69,7 @@ exportRouter.get(
   route(async (req, res) => {
     const id = idParam(req.params.id);
     if (!(await canViewProject(req, id))) throw new HttpError(404, 'Project not found.');
+    if (!(await seesProjectInternals(req, id))) throw new HttpError(403, 'The project export is for its manager and the PMO.');
     const { wb, code } = await projectWorkbook(id);
     await send(res, wb, `swish-pmo-${code}-${todayIso()}.xlsx`);
   }),

@@ -23,7 +23,7 @@ export interface Queryable {
 }
 
 /** Columns that hold JSON text. They are parsed on the way out (the PostgreSQL driver did it for jsonb). */
-const JSON_COLUMNS = new Set(['permissions', 'detail', 'data', 'areas', 'changes', 'snapshot', 'applied']);
+const JSON_COLUMNS = new Set(['permissions', 'detail', 'data', 'areas', 'changes', 'snapshot', 'applied', 'request', 'tours_seen']);
 
 function config(): sql.config {
   const url = process.env.DATABASE_URL || process.env.MSSQL_URL;
@@ -250,14 +250,23 @@ function schemaFile(): string {
 
 /** Connects, and creates whatever of the schema is missing. SKIP_SCHEMA=1 when a DBA runs sql/schema.sql by hand. */
 export async function initDb(): Promise<void> {
-  const p = await pool();
+  await pool();
   if (!ready && process.env.SKIP_SCHEMA !== '1') {
     const batches = fs
       .readFileSync(schemaFile(), 'utf8')
       .split(/^\s*GO\s*$/im)
       .map((b) => b.trim())
       .filter(Boolean);
-    for (const batch of batches) await p.request().batch(batch);
+    // On a connection of its own that is closed afterwards: the file starts with SET NOCOUNT ON, which would stay on for
+    // whichever pooled connection ran it and make that connection report no row counts for the rest of its life.
+    const setup = new sql.ConnectionPool({ ...config(), pool: { max: 1, min: 0 } });
+    setup.on('error', (error) => console.error('[db] connection error', error.message));
+    await setup.connect();
+    try {
+      for (const batch of batches) await setup.request().batch(batch);
+    } finally {
+      await setup.close().catch(() => undefined);
+    }
   }
   ready = true;
 }

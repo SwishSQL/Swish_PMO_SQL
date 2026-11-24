@@ -4,6 +4,11 @@ export class ApiError extends Error {
   }
 }
 
+// The closure documents milestone is named by the system in English; in Arabic it reads in Arabic everywhere.
+const CLOSURE_EN = 'Closure documents: closure report and signed sign-off checklist';
+const CLOSURE_AR = 'مستندات الإغلاق: تقرير الإغلاق وقائمة التحقق الموقّعة';
+const localize = (text: string) => (document.documentElement.lang === 'ar' && text.includes(CLOSURE_EN) ? text.split(CLOSURE_EN).join(CLOSURE_AR) : text);
+
 async function request<T>(method: string, url: string, body?: unknown): Promise<T> {
   const res = await fetch(url, {
     method,
@@ -11,12 +16,13 @@ async function request<T>(method: string, url: string, body?: unknown): Promise<
     headers: body === undefined ? undefined : { 'content-type': 'application/json' },
     body: body === undefined ? undefined : JSON.stringify(body),
   });
-  const text = await res.text();
+  const text = localize(await res.text());
   const data = text ? JSON.parse(text) : null;
   if (!res.ok) {
     if (res.status === 401 && !url.startsWith('/api/auth/')) window.dispatchEvent(new Event('pmo:signed-out'));
     throw new ApiError(res.status, data?.error ?? `Request failed (${res.status})`);
   }
+  if (method !== 'GET') window.dispatchEvent(new Event('pmo:saved'));
   return data as T;
 }
 

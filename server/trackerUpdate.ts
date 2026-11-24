@@ -109,7 +109,8 @@ export async function readTracker(buf: Buffer): Promise<{ rows: TrackerRow[]; ba
   } catch {
     throw new HttpError(400, 'This is not an Excel workbook (.xlsx).');
   }
-  const ws = wb.worksheets.find((w) => w.name.toLowerCase() === 'in') ?? wb.worksheets[0];
+  // The full workbook (Instructions, Dashboard, Projects, Milestones...) keeps the rows on "Milestones"; an export has one sheet.
+  const ws = wb.worksheets.find((w) => ['milestones', 'in'].includes(w.name.trim().toLowerCase())) ?? wb.worksheets[0];
   if (!ws) throw new HttpError(400, 'The workbook has no sheet.');
   let head = 0;
   ws.eachRow((r, n) => {
@@ -373,7 +374,7 @@ export async function runTracker(q: Queryable, parsed: { rows: TrackerRow[]; bas
     if (!apply) continue;
 
     const health = healthOf(statuses);
-    const stage = health === 'done' ? 'closed' : health === 'not_started' ? 'planning' : 'execution';
+    const stage = health === 'done' ? 'closure' : health === 'not_started' ? 'planning' : 'execution';
     const { rows: pr } = await q.query(
       `INSERT INTO projects (code, name, department_id, priority, stage, health, start_date, end_date, baseline_start, baseline_end, progress, created_by, initiative_id)
        OUTPUT INSERTED.id VALUES ($1,$2,$3,'medium',$4,$5,$6,$7,$6,$7,0,$8,$9)`,

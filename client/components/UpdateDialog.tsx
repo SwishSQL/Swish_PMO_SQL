@@ -6,6 +6,7 @@ import { useLoad, useToast } from '../lib/app';
 import { useT } from '../lib/i18n';
 import { fmtDate } from '../lib/format';
 import { Dialog, Field, HealthIcon } from './ui';
+import { MentionTextarea } from './MentionTextarea';
 
 const CHOICES: Health[] = ['on_track', 'at_risk', 'off_track'];
 
@@ -32,7 +33,8 @@ export function UpdateDialog({
   const [health, setHealth] = useState<Health>(
     existing?.health ?? (CHOICES.includes(currentHealth) ? currentHealth : 'on_track'),
   );
-  const [progress, setProgress] = useState(existing?.progress ?? planProgress);
+  // The % comes from the plan (milestones and tasks), not from this form.
+  const progress = planProgress;
   const [accomplishments, setAccomplishments] = useState(existing?.accomplishments ?? '');
   const [nextSteps, setNextSteps] = useState(existing?.nextSteps ?? '');
   const [blockers, setBlockers] = useState(existing?.blockers ?? '');
@@ -49,7 +51,6 @@ export function UpdateDialog({
     setError(null);
     try {
       const d = await api.post<{ health: Health; accomplishments: string; nextSteps: string; blockers: string; decisions: string; basedOn: number }>(`/api/ai/weekly-draft/${projectId}`);
-      setHealth(d.health);
       setAccomplishments(d.accomplishments);
       setNextSteps(d.nextSteps);
       setBlockers(d.blockers);
@@ -121,31 +122,29 @@ export function UpdateDialog({
       <div className="form-grid">
         <div className="field">
           <span>{t('health')}</span>
-          <div className="segmented" role="radiogroup" aria-label={t('health')}>
-            {CHOICES.map((h) => (
-              <button key={h} type="button" role="radio" aria-checked={health === h} aria-pressed={health === h} onClick={() => setHealth(h)}>
-                <span className={`h-${h}`} style={{ display: 'inline-flex' }}>
-                  <HealthIcon health={h} size={15} />
-                </span>
-                {t(`health_${h}`)}
-              </button>
-            ))}
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginTop: 6 }}>
+            <span className={`pill h-${currentHealth}`}>
+              <HealthIcon health={currentHealth} size={14} /> {t(`health_${currentHealth}`)}
+            </span>
+            <span className="muted" style={{ fontSize: 12 }}>{t('healthFromPlan')}</span>
           </div>
         </div>
-        <Field label={`${t('progress')} ${progress}%`}>
-          <input type="range" min={0} max={100} step={1} value={progress} onChange={(e) => setProgress(Number(e.target.value))} style={{ accentColor: 'var(--ink)', marginTop: 8 }} />
+        <Field label={`${t('progress')} ${progress}%`} hint={t('progressFromPlan')}>
+          <div className="meter" style={{ marginTop: 12 }} aria-hidden>
+            <i style={{ width: `${progress}%` }} />
+          </div>
         </Field>
         <Field label={t('accomplishments')} className="span-2">
-          <textarea className="textarea" value={accomplishments} onChange={(e) => setAccomplishments(e.target.value)} />
+          <MentionTextarea className="textarea" value={accomplishments} onChange={(e) => setAccomplishments(e.target.value)} />
         </Field>
         <Field label={t('nextSteps')}>
-          <textarea className="textarea" value={nextSteps} onChange={(e) => setNextSteps(e.target.value)} />
+          <MentionTextarea className="textarea" value={nextSteps} onChange={(e) => setNextSteps(e.target.value)} />
         </Field>
         <Field label={t('blockers')}>
-          <textarea className="textarea" value={blockers} onChange={(e) => setBlockers(e.target.value)} />
+          <MentionTextarea className="textarea" value={blockers} onChange={(e) => setBlockers(e.target.value)} />
         </Field>
         <Field label={t('decisions')} hint={t('decisionsHint')} className="span-2">
-          <textarea className="textarea" style={{ minHeight: 64 }} value={decisions} onChange={(e) => setDecisions(e.target.value)} />
+          <MentionTextarea className="textarea" style={{ minHeight: 64 }} value={decisions} onChange={(e) => setDecisions(e.target.value)} />
         </Field>
       </div>
     </Dialog>

@@ -17,6 +17,7 @@ import type { Dependency, Task, User } from '../../shared/types';
 import { addDays, diffDays, fromDay, toDay, weekday } from '../../shared/dates';
 import { criticalPath, rollUp } from '../../shared/schedule';
 import { useT } from '../lib/i18n';
+import { milestoneTone } from '../lib/milestoneTone';
 import { fmtDate, fmtMonth, initials } from '../lib/format';
 import { safeGet, safeSet, useApp } from '../lib/app';
 import { useCalendar } from '../lib/calendar';
@@ -67,7 +68,11 @@ interface Props {
   /** The project has an approved baseline: milestones are added, moved or removed by change requests. */
   baselined?: boolean;
   /** The baseline command this person may run, if any: re-baseline (PMO) or baseline new items. */
-  baseline: { label: string; onClick: () => void } | null;
+  baseline: { label: string; onClick: () => void; highlight?: boolean } | null;
+  /** For someone who works on the project without running it: which items are theirs (the rest are greyed). */
+  mine?: (task: Task) => boolean;
+  /** The person runs the project: their items are marked, the others stay as they are. */
+  mineOnlyMarks?: boolean;
   editingId: number | null;
   setEditingId: (id: number | null) => void;
 }
@@ -116,6 +121,7 @@ export function Gantt(props: Props) {
   const [zoom, setZoomState] = useState<Zoom>(() => (safeGet('pmo.zoom') as Zoom) || 'month');
   const [showCritical, setShowCritical] = useState(true);
   const [showBaseline, setShowBaseline] = useState(true);
+  const [onlyMine, setOnlyMine] = useState(false);
   const [collapsed, setCollapsed] = useState<Set<number>>(new Set());
   const [drag, setDrag] = useState<Drag | null>(null);
   const scroller = useRef<HTMLDivElement>(null);
@@ -146,9 +152,20 @@ export function Gantt(props: Props) {
       kids.set(k, [...(kids.get(k) ?? []), tk]);
     }
     for (const l of kids.values()) l.sort((a, b) => a.sort - b.sort || a.id - b.id);
+    // "Only mine": the person's items and the phases or milestones above them, nothing else.
+    let keep: Set<number> | null = null;
+    if (onlyMine && props.mine) {
+      const byId = new Map(tasks.map((x) => [x.id, x]));
+      keep = new Set<number>();
+      for (const tk of tasks) {
+        if (!props.mine(tk)) continue;
+        for (let p: Task | undefined = tk; p && !keep.has(p.id); p = p.parentId ? byId.get(p.parentId) : undefined) keep.add(p.id);
+      }
+    }
     const out: Row[] = [];
     const walk = (parent: number | null, depth: number, prefix: string) => {
       (kids.get(parent) ?? []).forEach((tk, i) => {
+        if (keep && !keep.has(tk.id)) return;
         const wbs = prefix ? `${prefix}.${i + 1}` : `${i + 1}`;
         const hasChildren = (kids.get(tk.id) ?? []).length > 0;
         out.push({ task: tk, depth, wbs, hasChildren });
@@ -157,7 +174,8 @@ export function Gantt(props: Props) {
     };
     walk(null, 0, '');
     return out;
-  }, [tasks, collapsed]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [tasks, collapsed, onlyMine]);
 
   const crit = useMemo(() => criticalPath(tasks, plan.dependencies), [tasks, plan.dependencies]);
 
@@ -297,7 +315,7 @@ export function Gantt(props: Props) {
             {props.baseline && (
               <>
                 <span className="sep" />
-                <button className="btn btn-ghost btn-sm" onClick={props.baseline.onClick}>
+                <button className={`btn btn-sm ${props.baseline.highlight ? 'btn-primary btn-pulse' : 'btn-ghost'}`} onClick={props.baseline.onClick}>
                   <PushPin size={15} aria-hidden />
                   {props.baseline.label}
                 </button>
@@ -306,6 +324,12 @@ export function Gantt(props: Props) {
           </>
         )}
         <span className="spacer" />
+        {props.mine && (
+          <label className="toggle">
+            <input type="checkbox" checked={onlyMine} onChange={(e) => setOnlyMine(e.target.checked)} />
+            {t('onlyMine')}
+          </label>
+        )}
         <label className="toggle">
           <input type="checkbox" checked={showCritical} onChange={(e) => setShowCritical(e.target.checked)} />
           {t('criticalPath')}
@@ -353,12 +377,12 @@ export function Gantt(props: Props) {
                   key={tk.id}
                   role="row"
                   aria-selected={tk.id === selectedId}
-                  className={`g-row ${tk.id === selectedId ? 'selected' : ''} ${tk.kind === 'summary' ? 'is-summary' : ''} ${tk.notRequired ? 'not-required' : ''}`}
+                  className={`g-row ${tk.id === selectedId ? 'selected' : ''} ${tk.kind === 'summary' ? 'is-summary' : ''} ${tk.notRequired ? 'not-required' : ''} ${props.mine && tk.kind !== 'summary' ? (props.mine(tk) ? 'is-mine' : tk.systemKey || props.mineOnlyMarks ? '' : 'is-locked') : ''}`}
                   tabIndex={0}
                   // Whoever cannot rename opens the task with a click: a team member on their own task, or a viewer.
                   onClick={() => {
                     onSelect(tk.id);
-                    if (!canEdit) props.onOpen(tk.id);
+                    props.onOpen(tk.id);
                   }}
                   onDoubleClick={() => canEdit && setEditingId(tk.id)}
                   onKeyDown={(e) => {
@@ -387,7 +411,15 @@ export function Gantt(props: Props) {
                     ) : (
                       <span className="caret-gap" />
                     )}
-                    {tk.kind === 'milestone' && <Diamond size={12} weight="fill" style={{ flex: 'none', color: 'var(--ink-2)' }} aria-hidden />}
+                    {tk.kind === 'milestone' &&
+                      (() => {
+                        const tone = milestoneTone({ ...tk, date: tk.endDate }, today);
+                        return (
+                          <span className={`ms-tone-${tone}`} title={t(`ms_${tone}`)} style={{ display: 'inline-flex', flex: 'none' }}>
+                            <Diamond size={12} weight="fill" style={{ color: 'var(--ms-c)' }} aria-label={t(`ms_${tone}`)} />
+                          </span>
+                        );
+                      })()}
                     {editingId === tk.id ? (
                       <input
                         autoFocus
@@ -410,6 +442,7 @@ export function Gantt(props: Props) {
                         {tk.name}
                       </span>
                     )}
+                    {props.mine && tk.kind !== 'summary' && props.mine(tk) && <span className="mine-chip">{t('mineTag')}</span>}
                     {tk.notRequired && <span className="flag-chip" style={{ flex: 'none' }}>{t('notRequired')}</span>}
                     {isCrit && <span className="crit-dot" title={t('criticalPath')} />}
                   </div>

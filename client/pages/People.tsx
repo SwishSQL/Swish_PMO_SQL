@@ -21,28 +21,32 @@ import {
   ShieldStar,
   Trash,
   UserPlus,
+  TreeStructure,
 } from '@phosphor-icons/react';
 import type { DirectoryEntry, Permission, ProjectSummary, RoleDef, User } from '../../shared/types';
 import { PERMISSIONS, COMPANY_DOMAIN, isCompanyEmail } from '../../shared/permissions';
 import { api } from '../api';
-import { useApp, useLoad, useToast } from '../lib/app';
+import { navigate, useApp, useLoad, useToast } from '../lib/app';
 import { useT } from '../lib/i18n';
 import type { Key as TKey } from '../lib/i18n';
 import { deptName, fmtDateTime } from '../lib/format';
 import { SPRING, spotlight, stagger } from '../lib/motion';
 import { Avatar, deptColor, Dialog, Field, Segmented } from '../components/ui';
 import { ActivityTab, CalendarTab, DepartmentsTab } from './PeopleExtra';
+import { OrgChart } from '../components/OrgChart';
+import { PermissionMatrix } from '../components/PermissionMatrix';
+import { LearnMore } from '../components/Tour';
 
 /** makeHead: also make the person the head of their department (replacing the current head, if any). */
-type Draft = Partial<User> & { makeHead?: boolean };
+type Draft = Partial<User> & { makeHead?: boolean; sendEmail?: boolean };
 /** What the server returns once when it issues a setup link. */
-type WithLink = User & { inviteToken: string };
+type WithLink = User & { inviteToken?: string; emailed?: boolean; mailError?: string };
 interface IssuedLink {
   name: string;
   token: string;
   expiresAt: string | null;
 }
-const issued = (u: WithLink): IssuedLink => ({ name: u.name, token: u.inviteToken, expiresAt: u.inviteExpiresAt });
+const issued = (u: WithLink): IssuedLink | null => (u.inviteToken ? { name: u.name, token: u.inviteToken, expiresAt: u.inviteExpiresAt } : null);
 
 /** Shows a setup link once, to copy and send. Only its hash is kept on the server. */
 function InviteLinkDialog({ link, onClose }: { link: IssuedLink; onClose: () => void }) {
@@ -172,10 +176,11 @@ function DeleteUserDialog({ user, onClose, onDeleted }: { user: User; onClose: (
 /** Users & permissions: accounts, the directory of names the plans mention, and roles. */
 export function People({ tab }: { tab: string }) {
   const { t } = useT();
-  const known = ['users', 'directory', 'roles', 'departments', 'calendar', 'activity', 'backup'];
+  const known = ['users', 'org', 'directory', 'roles', 'departments', 'calendar', 'activity', 'backup'];
   const current = known.includes(tab) ? tab : 'users';
   const tabs = [
     { key: 'users', href: '#/people', icon: UserPlus, label: t('usersTab') },
+    { key: 'org', href: '#/people/org', icon: TreeStructure, label: t('org_title') },
     { key: 'directory', href: '#/people/directory', icon: AddressBook, label: t('directoryTab') },
     { key: 'roles', href: '#/people/roles', icon: ShieldCheck, label: t('rolesTab') },
     { key: 'departments', href: '#/people/departments', icon: Buildings, label: t('departmentsTab') },
@@ -188,6 +193,7 @@ export function People({ tab }: { tab: string }) {
       <div className="page-head">
         <div>
           <h1 className="page-title">{t('people')}</h1>
+          <LearnMore page="people" />
         </div>
       </div>
       <nav className="tabs" aria-label={t('people')}>
@@ -202,6 +208,8 @@ export function People({ tab }: { tab: string }) {
       <div key={current} className="tab-body">
         {current === 'users' ? (
           <UsersTab />
+        ) : current === 'org' ? (
+          <OrgChart editable />
         ) : current === 'directory' ? (
           <DirectoryTab />
         ) : current === 'departments' ? (
@@ -232,9 +240,19 @@ function UsersTab() {
   const { t, lang } = useT();
   const toast = useToast();
   const [draft, setDraft] = useState<Draft | null>(null);
+  // Opened from the Directory (or a link): ?edit=ID opens that account.
+  useEffect(() => {
+    const m = window.location.hash.match(/[?&]edit=(\d+)/);
+    if (!m) return;
+    const u = meta.users.find((x) => x.id === Number(m[1]));
+    if (u) setDraft({ ...u });
+    window.history.replaceState(null, '', window.location.hash.replace(/[?&]edit=\d+/, ''));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [roleFilter, setRoleFilter] = useState<string>('all');
+  const [query, setQuery] = useState('');
   const [link, setLink] = useState<IssuedLink | null>(null);
   const { data: projects } = useLoad(() => api.get<ProjectSummary[]>('/api/projects'), [], 'projects-all');
 
@@ -243,6 +261,13 @@ function UsersTab() {
   for (const p of projects ?? []) if (p.managerId) projectCount.set(p.managerId, (projectCount.get(p.managerId) ?? 0) + 1);
   const shown = meta.users
     .filter((u) => roleFilter === 'all' || u.roleId === roleFilter)
+    // Name, email, title or department: any part of it, in any case.
+    .filter((u) => {
+      const q = query.trim().toLowerCase();
+      if (!q) return true;
+      const d = meta.departments.find((x) => x.id === u.departmentId);
+      return [u.name, u.email, u.title, d?.name, d?.nameAr].some((v) => (v ?? '').toLowerCase().includes(q));
+    })
     .sort((a, b) => Number(b.active) - Number(a.active) || a.name.localeCompare(b.name));
 
   const save = async () => {
@@ -256,6 +281,8 @@ function UsersTab() {
         const original = meta.users.find((u) => u.id === draft.id);
         const saved = await api.patch(`/api/users/${draft.id}`, {
           name: draft.name,
+          // The sign-in email, only when it changed.
+          ...(original && draft.email && draft.email.toLowerCase() !== original.email.toLowerCase() ? { email: draft.email } : {}),
           title: draft.title ?? null,
           roleId: draft.roleId,
           departmentId: draft.departmentId ?? null,
@@ -265,9 +292,10 @@ function UsersTab() {
         });
         headOf = (saved as { linkedHeadOf?: string | null }).linkedHeadOf ?? null;
       } else {
-        const made = await api.post<WithLink & { linkedHeadOf?: string | null }>('/api/users', draft);
+        const made = await api.post<WithLink & { linkedHeadOf?: string | null; held?: boolean }>('/api/users', { ...draft, sendEmail: draft.sendEmail === true });
         headOf = made.linkedHeadOf ?? null;
-        setLink(issued(made));
+        if (made.held) toast(t('setupHeld', { name: made.name }));
+        else told(made);
       }
       await reloadMeta();
       setDraft(null);
@@ -304,10 +332,17 @@ function UsersTab() {
     }
   };
 
+  // What happened to the setup link: emailed to the person, failed (resend later), or, with no mail set up, shown here.
+  const told = (u: WithLink) => {
+    if (u.emailed) toast(t('setupEmailed', { name: u.name, email: u.email }));
+    else if (u.inviteToken) setLink(issued(u));
+    else toast(t('setupEmailFailed', { name: u.name, error: u.mailError ?? '' }), 'bad');
+  };
+
   const resetPassword = async (u: User) => {
     if (!window.confirm(t('confirmReset', { name: u.name }))) return;
     try {
-      setLink(issued(await api.post<WithLink>(`/api/users/${u.id}/reset-password`)));
+      told(await api.post<WithLink>(`/api/users/${u.id}/reset-password`));
       await reloadMeta();
     } catch (e) {
       toast((e as Error).message, 'bad');
@@ -317,10 +352,26 @@ function UsersTab() {
   // A lost or expired link: issue another. The old one stops working.
   const newLink = async (u: User) => {
     try {
-      setLink(issued(await api.post<WithLink>(`/api/users/${u.id}/invite`)));
+      told(await api.post<WithLink>(`/api/users/${u.id}/invite`));
       await reloadMeta();
     } catch (e) {
       toast((e as Error).message, 'bad');
+    }
+  };
+
+  // Accounts made before launch whose setup email is still held: sent all at once, after a confirmation.
+  const held = meta.users.filter((u) => u.active && u.pending && u.setupEmailed === false);
+  const sendAll = async () => {
+    if (!window.confirm(t('sendAllSetupConfirm', { n: held.length }))) return;
+    setMailBusy(true);
+    try {
+      const r = await api.post<{ sent: number; failed: string[] }>('/api/users/send-setup-emails');
+      toast(r.failed.length ? t('sendAllSetupPartial', { n: r.sent, failed: r.failed.join(', ') }) : t('sendAllSetupDone', { n: r.sent }), r.failed.length ? 'bad' : 'ok');
+      await reloadMeta();
+    } catch (e) {
+      toast((e as Error).message, 'bad');
+    } finally {
+      setMailBusy(false);
     }
   };
 
@@ -340,8 +391,18 @@ function UsersTab() {
             ...meta.roles.map((r) => ({ value: r.id, label: lang === 'ar' && r.nameAr ? r.nameAr : r.name })),
           ]}
         />
+        <div className="search" style={{ flex: '1 1 240px', maxWidth: 360 }}>
+          <MagnifyingGlass size={16} aria-hidden />
+          <input className="input" type="search" placeholder={t('us_search')} aria-label={t('us_search')} value={query} onChange={(e) => setQuery(e.target.value)} />
+        </div>
+        {meta.emailSignIn && held.length > 0 && (
+          <button className="btn btn-sm" style={{ marginInlineStart: 'auto' }} disabled={mailBusy} onClick={sendAll}>
+            <EnvelopeSimple size={15} aria-hidden />
+            {t('sendAllSetup', { n: held.length })}
+          </button>
+        )}
         {meta.emailSignIn && (
-          <button className="btn btn-ghost btn-sm" style={{ marginInlineStart: 'auto' }} disabled={mailBusy} onClick={testMail}>
+          <button className="btn btn-ghost btn-sm" style={held.length > 0 ? undefined : { marginInlineStart: 'auto' }} disabled={mailBusy} onClick={testMail}>
             <EnvelopeSimple size={15} aria-hidden />
             {t('mailTest')}
           </button>
@@ -432,8 +493,8 @@ function UsersTab() {
                     )}
                     {u.active && u.pending && (
                       <button className="btn btn-sm" onClick={() => newLink(u)}>
-                        <LinkSimple size={15} aria-hidden />
-                        {t('newSetupLink')}
+                        <EnvelopeSimple size={15} aria-hidden />
+                        {u.setupEmailed === false ? t('sendSetupEmail') : t('resendSetupEmail')}
                       </button>
                     )}
                     {u.id !== meta.me.id && !isOwnerCard && (
@@ -475,12 +536,12 @@ function UsersTab() {
           }
         >
           <div className="form-grid">
-            <Field label={t('companyEmail')} className="span-2">
+            <Field label={t('companyEmail')} className="span-2" hint={draft.id && !draft.owner ? t('emailChangeHint') : undefined}>
               <input
                 className="input"
                 type="email"
                 dir="ltr"
-                disabled={!!draft.id}
+                disabled={!!draft.owner}
                 placeholder={`name${COMPANY_DOMAIN}`}
                 value={draft.email ?? ''}
                 onChange={(e) => setDraft({ ...draft, email: e.target.value.trim() })}
@@ -491,6 +552,15 @@ function UsersTab() {
             </Field>
             <Field label={t('jobTitle')}>
               <input className="input" value={draft.title ?? ''} onChange={(e) => setDraft({ ...draft, title: e.target.value })} />
+            </Field>
+            <Field label={t('ai_awayUntil')} hint={t('ai_awayHint')}>
+              <input className="input" type="date" value={draft.awayUntil ?? ''} onChange={(e) => setDraft({ ...draft, awayUntil: e.target.value || null })} />
+            </Field>
+            <Field label={t('ai_pausedLabel')}>
+              <label style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+                <input type="checkbox" checked={!!draft.aiPaused} onChange={(e) => setDraft({ ...draft, aiPaused: e.target.checked })} />
+                <span>{t('ai_pausedHint')}</span>
+              </label>
             </Field>
             <Field label={t('role')}>
               <select
@@ -538,6 +608,17 @@ function UsersTab() {
                 </label>
               );
             })()}
+            {!draft.id && (
+              <label className="check-row span-2">
+                <input type="checkbox" checked={!!draft.sendEmail} onChange={(e) => setDraft({ ...draft, sendEmail: e.target.checked })} />
+                <span>
+                  <strong>{t('sendSetupNow')}</strong>
+                  <span className="muted" style={{ fontSize: 13 }}>
+                    {t('sendSetupNowHint')}
+                  </span>
+                </span>
+              </label>
+            )}
             {/* Only the owner appoints system admins, and the owner is always one. */}
             {meta.isOwner && !draft.owner && (
               <label className="check-row span-2">
@@ -695,6 +776,11 @@ function DirectoryTab() {
   const [giving, setGiving] = useState<DirectoryEntry | null>(null);
   const [link, setLink] = useState<IssuedLink | null>(null);
   const [merging, setMerging] = useState<DirectoryEntry | null>(null);
+  const told = (u: WithLink) => {
+    if (u.emailed) toast(t('setupEmailed', { name: u.name, email: u.email }));
+    else if (u.inviteToken) setLink(issued(u));
+    else toast(t('setupEmailFailed', { name: u.name, error: u.mailError ?? '' }), 'bad');
+  };
 
   if (error) return <div className="panel"><div className="panel-body field-error">{error}</div></div>;
   if (!data) return <div className="skeleton" style={{ height: 420, borderRadius: 14 }} />;
@@ -757,7 +843,17 @@ function DirectoryTab() {
             {shown.map((d, i) => {
               const u = user(d.userId);
               return (
-                <tr key={d.name} className="enter" style={stagger(i)}>
+                <tr
+                  key={d.name}
+                  className={`enter${u || d.kind === 'person' ? ' clickable' : ''}`}
+                  style={stagger(i)}
+                  // A name with an account opens its account to see and edit; a person without one, Give access.
+                  onClick={(e) => {
+                    if ((e.target as HTMLElement).closest('button, a')) return;
+                    if (u) navigate(`/people?edit=${u.id}`);
+                    else if (d.kind === 'person') setGiving(d);
+                  }}
+                >
                   <td style={{ minWidth: 220 }}>
                     <div style={{ fontWeight: 500 }}>{d.name}</div>
                     <span className={`dir-kind k-${d.kind}`}>{t(`dirOne_${d.kind}`)}</span>
@@ -793,10 +889,13 @@ function DirectoryTab() {
                         {t('giveAccess')}
                       </button>
                     )}
-                    <button className="btn btn-ghost btn-sm" onClick={() => setMerging(d)} title={t('mergeInto')}>
-                      <ArrowsMerge size={14} aria-hidden />
-                      {t('merge')}
-                    </button>
+                    {/* A name linked to an account is settled: merging is for spellings still on their own. */}
+                    {!u && (
+                      <button className="btn btn-ghost btn-sm" onClick={() => setMerging(d)} title={t('mergeInto')}>
+                        <ArrowsMerge size={14} aria-hidden />
+                        {t('merge')}
+                      </button>
+                    )}
                   </td>
                 </tr>
               );
@@ -811,7 +910,7 @@ function DirectoryTab() {
           onClose={() => setGiving(null)}
           onDone={async (created) => {
             setGiving(null);
-            setLink(issued(created));
+            told(created);
             await reloadMeta();
             reload();
             toast(t('accessGiven', { name: giving.name }));
@@ -987,6 +1086,25 @@ function MergeDialog({
 const GROUPS = ['projects', 'review'] as const;
 
 function RolesTab() {
+  const [view, setView] = useState<'table' | 'role'>('table');
+  const { t: tt } = useT();
+  return (
+    <div style={{ display: 'grid', gap: 12 }}>
+      <Segmented
+        label={tt('pm_view')}
+        value={view}
+        onChange={setView}
+        options={[
+          { value: 'table', label: tt('pm_table') },
+          { value: 'role', label: tt('pm_byRole') },
+        ]}
+      />
+      {view === 'table' ? <PermissionMatrix /> : <RoleEditor />}
+    </div>
+  );
+}
+
+function RoleEditor() {
   const { meta, reloadMeta } = useApp();
   const { t, lang } = useT();
   const toast = useToast();

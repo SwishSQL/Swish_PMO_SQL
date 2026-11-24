@@ -5,7 +5,10 @@ import { useToast } from '../lib/app';
 import { Dialog, Field } from './ui';
 import { motion } from 'motion/react';
 import {
+  CaretDoubleLeft,
+  CaretDoubleRight,
   ChartLineUp,
+  Eye,
   CheckSquare,
   FlagBanner,
   Gauge,
@@ -19,16 +22,23 @@ import {
   Translate,
   UsersThree,
   Path,
+  TreeStructure,
+  ChartLine,
+  Question,
 } from '@phosphor-icons/react';
 import { diffDays, spanDays } from '../../shared/dates';
 import { useApp } from '../lib/app';
 import { useT } from '../lib/i18n';
 import { fmtDateTime } from '../lib/format';
-import { MIN_PASSWORD } from '../../shared/permissions';
+import { LEADS_PROJECTS, MIN_PASSWORD } from '../../shared/permissions';
 import { SPRING } from '../lib/motion';
-import { Avatar, BrandMark } from './ui';
+import { Avatar, BrandMark, useLatest } from './ui';
 import { NotificationBell } from './Notifications';
 import { SearchButton } from './Search';
+import { ViewAsBanner, ViewAsDialog } from './ViewAs';
+import { ActionPopup } from './ActionPopup';
+import { OpenTaskHost } from './OpenTask';
+import { Tour, startTour } from './Tour';
 
 /** Where today sits in the selected quarter: the one piece of chrome that is live. */
 function QuarterPulse() {
@@ -84,7 +94,7 @@ function QuarterPulse() {
 }
 
 /** Who I am, my role, and changing my own password. */
-function AccountDialog({ onClose }: { onClose: () => void }) {
+function AccountDialog({ onClose, onSignOut }: { onClose: () => void; onSignOut: () => void }) {
   const { meta, roleName, dept } = useApp();
   const { t, lang } = useT();
   const toast = useToast();
@@ -110,6 +120,11 @@ function AccountDialog({ onClose }: { onClose: () => void }) {
       width={460}
       footer={
         <>
+          {/* Sign out here too: the name is where many people look for it. */}
+          <button className="btn btn-ghost" style={{ marginInlineEnd: 'auto' }} onClick={onSignOut}>
+            <SignOut size={16} aria-hidden />
+            {t('signOut')}
+          </button>
           <button className="btn" onClick={onClose}>
             {t('close')}
           </button>
@@ -179,17 +194,52 @@ export function Shell({
   const { meta, can, roleName } = useApp();
   const { t, lang, setLang } = useT();
   const [account, setAccount] = useState(false);
+  const [viewAs, setViewAs] = useState(false);
   // On a phone the sidebar is a slim header and this is the menu that opens from it.
   const [menu, setMenu] = useState(false);
+  // On a computer it folds to a rail of icons. The person's choice is kept; without one, small screens start folded.
+  const [collapsed, setCollapsed] = useState<boolean>(() => {
+    try {
+      const saved = localStorage.getItem('pmo:sidebar');
+      if (saved) return saved === 'collapsed';
+    } catch {
+      /* no storage: the default below */
+    }
+    return window.innerWidth < 1280;
+  });
+  const toggle = () =>
+    setCollapsed((c) => {
+      try {
+        localStorage.setItem('pmo:sidebar', c ? 'open' : 'collapsed');
+      } catch {
+        /* the choice lasts this visit only */
+      }
+      return !c;
+    });
+  const toggleRef = useLatest(toggle);
+  useEffect(() => {
+    // Ctrl+B (Cmd+B on a Mac) shows or hides it, except while typing.
+    const onKey = (e: KeyboardEvent) => {
+      if (!(e.ctrlKey || e.metaKey) || e.key.toLowerCase() !== 'b' || e.altKey || e.shiftKey) return;
+      const el = e.target as HTMLElement | null;
+      if (el?.closest?.('input, textarea, select, [contenteditable="true"]')) return;
+      e.preventDefault();
+      toggleRef.current();
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [toggleRef]);
   const top = route[0] ?? 'portfolio';
-  const links = [
-    { key: 'portfolio', href: '#/portfolio', label: t('portfolio'), icon: Path, match: ['portfolio', 'projects'] },
-    { key: 'updates', href: '#/updates', label: t('weeklyReview'), icon: NotePencil, match: ['updates'] },
-  ];
-  links.splice(1, 0, { key: 'dashboard', href: '#/dashboard', label: t('dashboard'), icon: Gauge, match: ['dashboard'] });
-  links.push({ key: 'milestones', href: '#/milestones', label: t('milestonesPage'), icon: FlagBanner, match: ['milestones'] });
+  const leads = LEADS_PROJECTS.some((p) => can(p));
+  const links = [{ key: 'portfolio', href: '#/portfolio', label: t('portfolio'), icon: Path, match: ['portfolio', 'projects'] }];
+  if (leads) {
+    links.push({ key: 'dashboard', href: '#/dashboard', label: t('dashboard'), icon: Gauge, match: ['dashboard'] });
+    links.push({ key: 'updates', href: '#/updates', label: t('weeklyReview'), icon: NotePencil, match: ['updates'] });
+  }
+  if (leads) links.push({ key: 'milestones', href: '#/milestones', label: t('milestonesPage'), icon: FlagBanner, match: ['milestones'] });
   if (can('report.view')) links.push({ key: 'report', href: '#/report', label: t('report'), icon: ChartLineUp, match: ['report'] });
   links.push({ key: 'my-work', href: '#/my-work', label: t('myWork'), icon: CheckSquare, match: ['my-work'] });
+  if (can('projects.edit_all')) links.push({ key: 'insights', href: '#/insights', label: t('in_title'), icon: ChartLine, match: ['insights'] });
   if (meta.canManageUsers) {
     links.push({ key: 'people', href: '#/people', label: t('people'), icon: UsersThree, match: ['people'] });
   }
@@ -206,17 +256,29 @@ export function Shell({
     };
   }, [menu]);
   return (
-    <div className="shell">
+    <div className={`shell${collapsed ? ' rail' : ''}`}>
       <a className="sr-only" href="#main">
         Skip to content
       </a>
       <nav className={`sidebar ${menu ? 'open' : ''}`} aria-label="Main">
-        <a className="brand" href="#/portfolio">
-          <BrandMark className="brand-mark" onDark />
-          <span className="brand-name">
-            SWiSH <span>PMO</span>
-          </span>
-        </a>
+        <div className="brand-row">
+          <a className="brand" href="#/portfolio" title={collapsed ? 'SWiSH PMO' : undefined}>
+            <BrandMark className="brand-mark" onDark />
+            <span className="brand-name">
+              SWiSH <span>PMO</span>
+            </span>
+          </a>
+          <button
+            className="btn btn-ghost btn-icon btn-sm sidebar-toggle"
+            onClick={toggle}
+            aria-expanded={!collapsed}
+            aria-label={collapsed ? t('expandSidebar') : t('collapseSidebar')}
+            title={collapsed ? t('expandSidebar') : t('collapseSidebar')}
+            aria-keyshortcuts="Control+B"
+          >
+            {collapsed ? <CaretDoubleRight size={16} /> : <CaretDoubleLeft size={16} />}
+          </button>
+        </div>
         <SearchButton pages={links} />
         <button
           className="btn btn-ghost btn-icon menu-toggle"
@@ -229,20 +291,31 @@ export function Shell({
         {links.map((l) => {
           const active = l.match.includes(top);
           return (
-            <a key={l.key} className="nav-link" href={l.href} aria-current={active ? 'page' : undefined}>
+            <a key={l.key} className="nav-link" href={l.href} aria-current={active ? 'page' : undefined} title={collapsed ? l.label : undefined} aria-label={collapsed ? l.label : undefined}>
               {active && <motion.span layoutId="nav-pill" className="nav-pill" transition={SPRING} />}
               <l.icon size={18} weight={active ? 'fill' : 'regular'} aria-hidden />
-              {l.label}
+              <span className="nav-label">{l.label}</span>
             </a>
           );
         })}
+        {can('projects.edit_all') && !meta.viewingAs && (
+          <button className="nav-link nav-button" onClick={() => setViewAs(true)} title={collapsed ? t('va_title') : undefined} aria-label={collapsed ? t('va_title') : undefined}>
+            <Eye size={18} aria-hidden />
+            <span className="nav-label">{t('va_title')}</span>
+          </button>
+        )}
         <QuarterPulse />
         <div className="sidebar-foot">
           <div className="sidebar-tools">
-            <NotificationBell />
-            <button className="btn btn-ghost btn-sm tool-more" onClick={() => setLang(lang === 'en' ? 'ar' : 'en')} title={t('language')}>
+            <span data-tour="bell" style={{ display: 'inline-flex' }}>
+              <NotificationBell />
+            </span>
+            <button className="btn btn-ghost btn-sm btn-icon tool-more" onClick={startTour} aria-label={t('tour_help')} title={t('tour_help')}>
+              <Question size={16} />
+            </button>
+            <button data-tour="lang" className="btn btn-ghost btn-sm tool-more" onClick={() => setLang(lang === 'en' ? 'ar' : 'en')} title={t('language')}>
               <Translate size={16} aria-hidden />
-              {t('language')}
+              <span className="tool-label">{t('language')}</span>
             </button>
             <button
               className="btn btn-ghost btn-sm btn-icon tool-more"
@@ -256,7 +329,7 @@ export function Shell({
               <SignOut size={16} />
             </button>
           </div>
-          <button className="me" onClick={() => setAccount(true)} title={t('myAccount')}>
+          <button className="me" onClick={() => setAccount(true)} title={collapsed ? `${meta.me.name} · ${t('myAccount')}` : t('myAccount')}>
             <Avatar user={meta.me} />
             <div className="me-text">
               <div className="me-name">{meta.me.name}</div>
@@ -265,8 +338,13 @@ export function Shell({
           </button>
         </div>
       </nav>
-      {account && <AccountDialog onClose={() => setAccount(false)} />}
+      {account && <AccountDialog onClose={() => setAccount(false)} onSignOut={onSignOut} />}
+      {viewAs && <ViewAsDialog onClose={() => setViewAs(false)} />}
+      <ActionPopup />
+      <OpenTaskHost />
+      <Tour />
       <main className="main" id="main">
+        <ViewAsBanner />
         {children}
       </main>
     </div>

@@ -57,3 +57,16 @@ export function relativeDays(iso: string, today: string, lang: Lang): string {
   if (Math.abs(diff) < 14) return rtf.format(diff, 'day');
   return rtf.format(Math.round(diff / 7), 'week');
 }
+
+const TEAM_ROLE_AR: Record<string, string> = {
+  'Project manager': 'مدير المشروع',
+  'Team lead': 'قائد فريق',
+  Member: 'عضو',
+  'Subject matter expert': 'خبير متخصص',
+  'Stakeholder / Reviewer': 'صاحب مصلحة / مراجع',
+  'PMO coordinator': 'منسق الـPMO',
+};
+/** A team role, in the reader's language. */
+export function teamRoleLabel(role: string, lang: Lang): string {
+  return lang === 'ar' ? (TEAM_ROLE_AR[role] ?? role) : role;
+}

@@ -167,12 +167,14 @@ export async function loadPlan(visible: Set<number> | null): Promise<Capability[
   return c.rows.map((cap) => ({
     id: cap.id,
     name: cap.name,
+    managerUserId: cap.manager_user_id ?? null,
     dimensions: d.rows
       .filter((x) => x.capability_id === cap.id)
       .map((dim) => ({
         id: dim.id,
         capabilityId: cap.id,
         name: dim.name,
+        managerUserId: dim.manager_user_id ?? null,
         initiatives: i.rows
           .filter((x) => x.dimension_id === dim.id)
           .map((x) => ({

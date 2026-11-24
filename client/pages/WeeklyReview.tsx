@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { AnimatePresence, motion } from 'motion/react';
 import { CountUp, EASE_OUT, stagger } from '../lib/motion';
-import { ArrowRight, CaretLeft, CaretRight, PencilSimple, Presentation, X } from '@phosphor-icons/react';
+import { ArrowRight, ArrowSquareOut, CaretLeft, CaretRight, PencilSimple, Presentation, X } from '@phosphor-icons/react';
 import type { Health, MeetingNote, NoteKind, ProjectSummary, StatusUpdate } from '../../shared/types';
 import { addDays, weekStart } from '../../shared/dates';
 import { expectedProgress } from '../../shared/schedule';
@@ -10,8 +10,9 @@ import { navigate, useApp, useLoad, useToast } from '../lib/app';
 import { useT } from '../lib/i18n';
 import { deptName, fmtDate, fmtDateTime, projectName } from '../lib/format';
 import { UpdateDialog } from '../components/UpdateDialog';
-import { UpdateBody } from './ProjectPage';
+import { MeetingBrief } from '../components/MeetingBrief';
 import { deptColor, Empty, ErrorState, HealthBadge, HealthIcon, Meter, PageSkeleton, Person, Segmented } from '../components/ui';
+import { LearnMore } from '../components/Tour';
 
 interface WeekData {
   week: string;
@@ -45,7 +46,7 @@ export function WeeklyReview({ meeting }: { meeting: boolean }) {
     const byProject = new Map(updates.data.updates.map((u) => [u.projectId, u]));
     const prev = new Map(updates.data.previous.map((p) => [p.projectId, p]));
     return projects.data
-      .filter((p) => p.startDate <= addDays(week, 6) && p.stage !== 'closed')
+      .filter((p) => p.startDate <= addDays(week, 6) && p.health !== 'done')
       .map((p) => ({ p, u: byProject.get(p.id) ?? null, prev: prev.get(p.id) ?? null }))
       .sort((a, b) => RANK[a.u?.health ?? a.p.health] - RANK[b.u?.health ?? b.p.health] || a.p.code.localeCompare(b.p.code));
   }, [projects.data, updates.data, week]);
@@ -64,7 +65,10 @@ export function WeeklyReview({ meeting }: { meeting: boolean }) {
         rows={rows}
         week={week}
         onExit={() => navigate(`/updates?week=${week}`)}
-        onNoteAdded={() => updates.reload()}
+        onNoteAdded={() => {
+          updates.reload();
+          projects.reload();
+        }}
       />
     );
   }
@@ -74,6 +78,7 @@ export function WeeklyReview({ meeting }: { meeting: boolean }) {
       <div className="page-head">
         <div>
           <h1 className="page-title">{t('weeklyReview')}</h1>
+          <LearnMore page="standup" />
           <p className="page-sub">{t('updatesFiled', { n: filed, total: rows.length })}</p>
         </div>
         <div className="toolbar">
@@ -242,6 +247,8 @@ function Meeting({
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if ((e.target as HTMLElement).closest('input, textarea, select')) return;
+      // A popup open over the meeting takes its own keys: Esc closes it, not the meeting.
+      if (document.querySelector('.scrim')) return;
       const fwd = lang === 'ar' ? 'ArrowLeft' : 'ArrowRight';
       const back = lang === 'ar' ? 'ArrowRight' : 'ArrowLeft';
       if (e.key === fwd || e.key === 'j') setI((x) => Math.min(rows.length - 1, x + 1));
@@ -329,6 +336,7 @@ function Meeting({
 
         <AnimatePresence mode="wait" custom={dir}>
         <motion.div
+          className="mt-slide"
           key={p.id}
           custom={dir}
           variants={{
@@ -341,114 +349,69 @@ function Meeting({
           exit="exit"
           transition={{ duration: 0.38, ease: EASE_OUT }}
         >
-        <div className="code">
-          <span className="swatch" style={{ background: deptColor(d?.colorSlot), display: 'inline-block', marginInlineEnd: 6, verticalAlign: '-1px' }} />
-          {p.code} {deptName(d, lang)}
-        </div>
-        <h2 className="meeting-title">{projectName(p, lang)}</h2>
-        <div style={{ marginTop: 12, display: 'flex', gap: 16, alignItems: 'center', flexWrap: 'wrap' }}>
-          <Person user={user(p.managerId)} name={p.managerName} size="lg" />
-          {u ? <HealthBadge health={u.health} pill /> : <span className="pill h-at_risk">{t('pending')}</span>}
-          {prev && u && prev.health !== u.health && (
-            <span className="muted" style={{ fontSize: 13 }}>
-              {t('previousWeek')}: {t(`health_${prev.health}`)}
-            </span>
-          )}
-        </div>
-
-        <div className="big-figures">
-          <div>
-            <div className="figure num" style={{ fontSize: 44, letterSpacing: '-0.035em' }}>
-              <CountUp value={u?.progress ?? p.progress} duration={0.9} />
-              <small>%</small>
+        <div className="mt-hero">
+          <div className="mt-id">
+            <div className="code">
+              <span className="swatch" style={{ background: deptColor(d?.colorSlot), display: 'inline-block', marginInlineEnd: 6, verticalAlign: '-1px' }} />
+              {p.code} · {deptName(d, lang)} · {t(`stage_${p.stage}` as never)}
             </div>
-            <div className="figure-label">{t('progress')}</div>
-            <div style={{ width: 200, marginTop: 8 }}>
+            <h2 className="meeting-title" title={projectName(p, lang)}>
+              {projectName(p, lang)}
+            </h2>
+            <div className="mt-who">
+              <Person user={user(p.managerId)} name={p.managerName} />
+              <span title={t('healthFromPlan')}>
+                <HealthBadge health={p.health} pill />
+              </span>
+              <a className="btn btn-ghost btn-sm" href={`#/projects/${p.id}/plan`} target="_blank" rel="noreferrer">
+                <ArrowSquareOut size={14} aria-hidden /> {t('mbOpenProject')}
+              </a>
+              {prev && u && prev.health !== u.health && (
+                <span className="muted" style={{ fontSize: 12.5 }}>
+                  {t('previousWeek')}: {t(`health_${prev.health}`)}
+                </span>
+              )}
+            </div>
+          </div>
+          <div className="mt-kpis">
+            <div className="mt-kpi">
+              <span className="mt-kpi-label">{t('progress')}</span>
+              <span className="mt-kpi-value num">
+                <CountUp value={u?.progress ?? p.progress} duration={0.9} />%
+              </span>
               <Meter value={u?.progress ?? p.progress} expected={expected} />
+              <span className="mt-kpi-note" style={{ color: expected - (u?.progress ?? p.progress) > 3 ? 'var(--bad)' : undefined }}>
+                {expected - (u?.progress ?? p.progress) > 3 ? t('behindBy', { n: expected - (u?.progress ?? p.progress) }) : t('vsTime', { n: expected })}
+              </span>
             </div>
-            <div className="figure-note">
-              {expected - (u?.progress ?? p.progress) > 3
-                ? t('behindBy', { n: expected - (u?.progress ?? p.progress) })
-                : t('vsTime', { n: expected })}
+            <div className="mt-kpi">
+              <span className="mt-kpi-label">{t('finish')}</span>
+              <span className="mt-kpi-value num" style={{ color: p.health !== 'done' && p.endDate < meta.today ? 'var(--bad)' : undefined }}>
+                {fmtDate(p.endDate, lang, true)}
+              </span>
+              <span className="mt-kpi-note" style={{ color: (p.baselineSlip ?? 0) > 0 ? 'var(--bad)' : undefined }}>
+                {p.baselineFinish && p.baselineSlip ? t('movedFrom', { d: fmtDate(p.baselineFinish, lang) }) : ' '}
+              </span>
             </div>
-          </div>
-          <div>
-            <div className="figure num" style={{ fontSize: 22, paddingTop: 5 }}>
-              {fmtDate(p.endDate, lang, true)}
-            </div>
-            <div className="figure-label">{t('finish')}</div>
-            {p.baselineEnd && p.baselineEnd < p.endDate && (
-              <div className="figure-note" style={{ color: 'var(--bad)' }}>
-                {t('movedFrom', { d: fmtDate(p.baselineEnd, lang) })}
-              </div>
-            )}
-          </div>
-          {next && (
-            <div style={{ maxWidth: 280 }}>
-              <div className="figure num" style={{ fontSize: 22, paddingTop: 5, color: next.date < meta.today ? 'var(--bad)' : undefined }}>
-                {fmtDate(next.date, lang)}
-              </div>
-              <div className="figure-label">{t('nextMilestone')}</div>
-              <div className="figure-note">{next.name}</div>
-            </div>
-          )}
-        </div>
-
-        <div className="meeting-cols">
-          <div>
-            {u ? (
-              <UpdateBody u={u} />
-            ) : prev ? (
-              <>
-                <p className="pill h-at_risk" style={{ margin: '0 0 16px' }}>
-                  {t('noUpdateYet')} {t('showingLastWeek')}
-                </p>
-                <div style={{ opacity: 0.8 }}>
-                  <UpdateBody u={prev} />
-                </div>
-              </>
-            ) : (
-              <p className="muted">{t('noUpdateYet')}</p>
-            )}
-          </div>
-          <div className="panel" style={{ alignSelf: 'start' }}>
-            <div className="panel-head">
-              <h3 className="panel-title">{t('meetingNotes')}</h3>
-            </div>
-            <div className="panel-body" style={{ display: 'grid', gap: 10 }}>
-              {notes.length === 0 && <span className="muted" style={{ fontSize: 13 }}>-</span>}
-              {notes.map((n) => (
-                <div key={n.id} className="note" style={{ padding: 0 }}>
-                  <span className={`note-kind k-${n.kind}`}>{t(n.kind)}</span>
-                  <span>{n.body}</span>
-                </div>
-              ))}
-              {u && (
-                <div style={{ display: 'grid', gap: 8, marginTop: 6 }}>
-                  <Segmented
-                    label={t('addNote')}
-                    value={kind}
-                    onChange={setKind}
-                    options={(['decision', 'action', 'comment'] as NoteKind[]).map((k) => ({ value: k, label: t(k) }))}
-                  />
-                  <textarea
-                    className="textarea"
-                    style={{ minHeight: 64 }}
-                    value={text}
-                    aria-label={t('addNote')}
-                    onChange={(e) => setText(e.target.value)}
-                    onKeyDown={(e) => {
-                      if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) addNote();
-                    }}
-                  />
-                  <button className="btn btn-primary" style={{ justifySelf: 'start' }} disabled={!text.trim()} onClick={addNote}>
-                    {t('addNote')}
-                  </button>
-                </div>
+            <div className="mt-kpi mt-kpi-wide">
+              <span className="mt-kpi-label">{t('nextMilestone')}</span>
+              {next ? (
+                <>
+                  <span className="mt-kpi-value num" style={{ color: next.date < meta.today ? 'var(--bad)' : undefined }}>
+                    {fmtDate(next.date, lang, true)}
+                  </span>
+                  <span className="mt-kpi-note clamp-1" title={next.name}>
+                    {next.name}
+                  </span>
+                </>
+              ) : (
+                <span className="mt-kpi-value">-</span>
               )}
             </div>
           </div>
         </div>
+
+        <MeetingBrief projectId={p.id} week={week} onNoteAdded={onNoteAdded} />
         </motion.div>
         </AnimatePresence>
       </section>

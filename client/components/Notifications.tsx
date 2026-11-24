@@ -1,14 +1,16 @@
 import { useCallback, useEffect, useState } from 'react';
 import { AnimatePresence, motion } from 'motion/react';
-import { Bell, BellRinging, CalendarX, Checks, Megaphone, SealCheck, Siren, UserPlus, X } from '@phosphor-icons/react';
+import { Bell, BellRinging, CalendarX, Checks, Megaphone, SealCheck, Siren, UserPlus, X, At } from '@phosphor-icons/react';
 import { api } from '../api';
 import { useRoute } from '../lib/app';
 import { useT } from '../lib/i18n';
 import { fmtDate, fmtDateTime } from '../lib/format';
 import { EASE_OUT } from '../lib/motion';
 import { Drawer } from './ui';
+import { openTask } from './OpenTask';
+import { ActionsInBell, useMyActions } from './ActionPopup';
 
-interface Notification {
+export interface Notification {
   id: number;
   kind: string;
   projectId: number | null;
@@ -27,6 +29,7 @@ export function NotificationBell() {
   const route = useRoute();
   const [unread, setUnread] = useState(0);
   const [open, setOpen] = useState(false);
+  const { waiting } = useMyActions();
 
   const refresh = useCallback(async () => {
     try {
@@ -59,7 +62,8 @@ export function NotificationBell() {
         aria-label={unread ? t('notificationsUnread', { n: unread }) : t('notifications')}
         title={t('notifications')}
       >
-        {unread ? <BellRinging size={17} weight="fill" /> : <Bell size={17} />}
+        {unread || waiting ? <BellRinging size={17} weight="fill" /> : <Bell size={17} />}
+        {waiting && !unread && <span className="bell-dot" aria-hidden />}
         <AnimatePresence>
           {unread > 0 && (
             <motion.span
@@ -107,6 +111,8 @@ function NotificationsDrawer({ onClose, onCount }: { onClose: () => void; onCoun
   const open = async (n: Notification) => {
     if (!n.read) await markRead([n.id]);
     onClose();
+    // A milestone opens in its panel where you are; everything else goes to its page.
+    if (n.projectId && n.taskId && !n.kind.startsWith('change.') && !n.kind.startsWith('closure.')) return openTask(n.projectId, n.taskId);
     window.location.hash = link(n);
   };
 
@@ -128,6 +134,7 @@ function NotificationsDrawer({ onClose, onCount }: { onClose: () => void; onCoun
         </div>
       </div>
       <div className="dialog-body" style={{ flex: 1 }}>
+        <ActionsInBell onOpened={onClose} />
         {list === null ? (
           <div className="skeleton" style={{ height: 240, borderRadius: 12 }} />
         ) : list.length === 0 ? (
@@ -176,14 +183,16 @@ function NotificationsDrawer({ onClose, onCount }: { onClose: () => void; onCoun
 function icon(kind: string) {
   if (kind.startsWith('deadline.')) return <CalendarX size={16} />;
   if (kind === 'escalation.raised') return <Siren size={16} />;
-  if (kind === 'team.added' || kind === 'task.assigned' || kind === 'project.assigned' || kind === 'project.owner') return <UserPlus size={16} />;
+  if (kind === 'mention') return <At size={16} />;
+  if (kind === 'team.added' || kind === 'owner.requested' || kind === 'owner.decided' || kind === 'task.assigned' || kind === 'project.assigned' || kind === 'project.plan_started' || kind === 'project.owner') return <UserPlus size={16} />;
   if (kind.startsWith('closure.') || kind.startsWith('change.')) return <SealCheck size={16} />;
   return <Megaphone size={16} />;
 }
 
 /** Where a notification takes you. */
-function link(n: Notification): string {
+export function link(n: Notification): string {
   if (n.kind === 'reminder.daily') return '#/my-work';
+  if (n.kind === 'owner.requested') return '#/assignments';
   if (n.kind === 'reminder.weekly') return '#/updates';
   if (n.kind.startsWith('change.') && n.projectId) return `#/projects/${n.projectId}/changes`;
   if (n.projectId && n.taskId) return `#/projects/${n.projectId}/plan?task=${n.taskId}`;
@@ -192,7 +201,7 @@ function link(n: Notification): string {
 }
 
 type T = ReturnType<typeof useT>['t'];
-function text(n: Notification, t: T, lang: 'en' | 'ar'): string {
+export function text(n: Notification, t: T, lang: 'en' | 'ar'): string {
   const raw: Record<string, any> = n.data ?? {};
   // Names are mostly English inside Arabic sentences: isolating each keeps it whole, in its own direction.
   const iso = (s: unknown) => `⁨${s ?? ''}⁩`;
@@ -211,6 +220,8 @@ function text(n: Notification, t: T, lang: 'en' | 'ar'): string {
       return t('n_teamAdded', { by: d.by, project: d.project });
     case 'project.assigned':
       return t('n_projectAssigned', { by: d.by, project: d.project });
+    case 'project.plan_started':
+      return t('n_planStarted', { by: d.by, project: d.project });
     case 'project.owner':
       return t('n_projectOwner', { by: d.by, project: d.project });
     case 'change.pending':
@@ -229,6 +240,34 @@ function text(n: Notification, t: T, lang: 'en' | 'ar'): string {
       ].filter(Boolean);
       return t('n_daily', { parts: parts.join(lang === 'ar' ? '، ' : ', ') });
     }
+    case 'ai.reminder':
+      return t(raw.stage === 'before' ? 'n_aiBefore' : raw.stage === 'day' ? 'n_aiDay' : 'n_aiAfter', { name, due: fmtDate(raw.due, lang), project: d.project });
+    case 'ai.digest':
+      return t('n_aiDigest', { project: d.project, what: iso(raw.what ?? '') });
+    case 'task.coowner':
+      return t('n_coowner', { by: d.by, name });
+    case 'meeting.owner':
+      return t(raw.kind === 'decision_needed' ? 'n_meetingDecide' : 'n_meetingAction', { by: d.by, name, project: d.project });
+    case 'plan.manager':
+      return t(raw.role === 'portfolio' ? 'n_portfolioManager' : 'n_programManager', { by: d.by, name });
+    case 'department.head':
+      return t('n_deptHead', { by: d.by, name });
+    case 'ladder.role':
+      return t(raw.role === 'ceo' ? 'n_ladderCeo' : 'n_ladderIbe', { by: d.by });
+    case 'project.sponsor':
+      return t('n_sponsor', { by: d.by, project: d.project });
+    case 'project.stakeholder':
+      return t('n_stakeholder', { by: d.by, project: d.project });
+    case 'risk.assigned':
+      return t('n_riskAssigned', { by: d.by, name, project: d.project });
+    case 'mention':
+      return t('n_mention', { by: d.by, excerpt: iso(raw.excerpt ?? ''), project: d.project });
+    case 'project.unblocked':
+      return t('n_unblocked', { name, project: d.project });
+    case 'owner.requested':
+      return t('n_ownerRequested', { by: d.by, name, project: d.project });
+    case 'owner.decided':
+      return t(d.decision === 'approve' ? 'n_ownerApproved' : 'n_ownerDeclined', { by: d.by, name, to: d.to });
     case 'reminder.weekly':
       return t('n_weekly', { n: d.count, codes: iso((raw.codes ?? []).join(', ')) });
     default:
