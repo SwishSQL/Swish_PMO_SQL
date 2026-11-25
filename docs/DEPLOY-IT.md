@@ -80,7 +80,9 @@ again at every start).
 ## Moving the data from the PostgreSQL edition
 
 The running system keeps its data in PostgreSQL (Railway). The PostgreSQL edition's own backup file is a PostgreSQL script and cannot be
-loaded here, so a one-time command copies the data instead. Run it on the new system once, after its first start, while it is still empty:
+loaded here, so a one-time command copies the data instead. Run it once, **before the first `npm start`** (it creates the database and
+the tables itself, so the target is empty). If the system was already started, the first start has added the owner and the
+transformation plan, and the command then needs `--replace` to empty the target first:
 
 ```bash
 # PG_SOURCE_URL is the PostgreSQL connection string (it is only read); the target is the .env above.
