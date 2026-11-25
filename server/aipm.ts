@@ -1,7 +1,7 @@
 import { db } from './db';
 import { loadCalendar } from './calendar';
 import { notify, deciders } from './notify';
-import { ladder } from './escalation';
+import { CLOSED_FOR_DEADLINE, ladder } from './escalation';
 import { logActivity } from './service';
 import { reliable } from './insights';
 import { criticalPath } from '../shared/schedule';
@@ -78,7 +78,7 @@ export async function runAiPm(o: { now?: Date; force?: boolean; today?: string }
       `SELECT t.id, t.name, CONVERT(CHAR(10), t.end_date, 23) AS due, t.assignee_id, u.name AS owner, u.email, u.ai_paused, CONVERT(CHAR(10), u.away_until, 23) AS away_until,
               CAST(CASE WHEN u.setup_emailed_at IS NOT NULL OR u.password_hash IS NOT NULL THEN 1 ELSE 0 END AS BIT) AS invited,
               (SELECT CONVERT(CHAR(10), MAX(CAST(m.created_at AT TIME ZONE 'Arab Standard Time' AS DATE)), 23) FROM milestone_updates m WHERE m.task_id = t.id) AS last_update,
-              CAST(CASE WHEN EXISTS (SELECT 1 FROM escalations e WHERE e.task_id = t.id AND e.resolved_at IS NULL) THEN 1 ELSE 0 END AS BIT) AS escalated
+              CAST(CASE WHEN EXISTS (SELECT 1 FROM escalations e WHERE e.task_id = t.id AND e.resolved_at IS NULL) OR ${CLOSED_FOR_DEADLINE} THEN 1 ELSE 0 END AS BIT) AS escalated
          FROM tasks t JOIN users u ON u.id = t.assignee_id AND u.active = 1
         WHERE t.project_id = $1 AND t.kind = 'milestone' AND t.system_key IS NULL AND t.not_required = 0 AND t.status NOT IN ('done', 'cancelled')`,
       [p.id],

@@ -54,6 +54,37 @@ transformationRouter.get(
   }),
 );
 
+/** The PMO adds a program (dimension) to a portfolio (capability): { capabilityId, name, managerUserId? }. */
+transformationRouter.post(
+  '/transformation/dimensions',
+  route(async (req, res) => {
+    pmoOnly(req);
+    const capabilityId = Number(req.body?.capabilityId);
+    const name = typeof req.body?.name === 'string' ? req.body.name.trim().replace(/\s+/g, ' ').slice(0, 160) : '';
+    const managerUserId = req.body?.managerUserId ? Number(req.body.managerUserId) : null;
+    if (!Number.isInteger(capabilityId)) throw new HttpError(400, 'Choose the portfolio.');
+    if (!name) throw new HttpError(400, 'Name the program.');
+    const { rows: cap } = await db.query('SELECT id, name FROM capabilities WHERE id = $1', [capabilityId]);
+    if (!cap[0]) throw new HttpError(400, 'That portfolio does not exist.');
+    if (managerUserId !== null && !(await db.query('SELECT 1 FROM users WHERE id = $1 AND active = 1', [managerUserId])).rows.length) {
+      throw new HttpError(400, 'That program manager does not exist or is switched off.');
+    }
+    const { rows: dup } = await db.query('SELECT 1 FROM dimensions WHERE capability_id = $1 AND LOWER(name) = LOWER($2)', [capabilityId, name]);
+    if (dup.length) throw new HttpError(409, `${cap[0].name} already has a program called ${name}.`);
+    const { rows } = await db.query(
+      `INSERT INTO dimensions (capability_id, name, sort, manager_user_id)
+       OUTPUT INSERTED.id
+       VALUES ($1, $2, (SELECT COALESCE(MAX(sort), 0) + 1 FROM dimensions WHERE capability_id = $1), $3)`,
+      [capabilityId, name, managerUserId],
+    );
+    await logActivity(db, null, req.user!.id, 'plan.program_added', { capability: cap[0].name, name, managerUserId });
+    if (managerUserId && managerUserId !== req.user!.id) {
+      await notify(db, [managerUserId], { kind: 'plan.manager', data: { name, role: 'program', by: req.user!.name } }, req.user!.id);
+    }
+    res.status(201).json({ id: rows[0].id });
+  }),
+);
+
 /** The PMO names the manager of a portfolio (capability) or a program (dimension). */
 transformationRouter.put(
   '/transformation/manager',

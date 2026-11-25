@@ -21,7 +21,7 @@ import { CountUp, spotlight, stagger } from '../lib/motion';
 import { HomeSummary } from '../components/HomeSummary';
 import { CATEGORY_PREVIEW_USERS, CategoryCards, MyMilestonesCell, categorySets } from '../components/CategoryCards';
 import type { Category } from '../components/CategoryCards';
-import { PlanManagerCard } from '../components/PlanManagers';
+import { AddProgramButton, PlanManagerCard } from '../components/PlanManagers';
 import { MyIndicator } from './Insights';
 import { LearnMore } from '../components/Tour';
 
@@ -207,7 +207,10 @@ export function Portfolio({ path = [] }: { path?: string[] }) {
         </p>
         {level.kind === 'root' && <MyIndicator />}
         {level.kind === 'capability' && where.capability && (
-          <PlanManagerCard kind="capability" id={where.capability.id} userId={where.capability.managerUserId} onChanged={planLoad.reload} />
+          <div style={{ display: 'flex', alignItems: 'center', gap: 12, flexWrap: 'wrap' }}>
+            <PlanManagerCard kind="capability" id={where.capability.id} userId={where.capability.managerUserId} onChanged={planLoad.reload} />
+            <AddProgramButton capabilityId={where.capability.id} capabilityName={where.capability.name} onAdded={planLoad.reload} />
+          </div>
         )}
         {level.kind === 'dimension' && where.dimension && (
           <PlanManagerCard kind="dimension" id={where.dimension.id} userId={where.dimension.managerUserId} onChanged={planLoad.reload} />

@@ -176,8 +176,10 @@ followupRouter.post(
     const task = await taskInfo(rows[0].task_id);
     await assertCanEscalate(req, task.projectId, rows[0].task_id, 'Only the PMO, the project owner and the person the task is given to can close an escalation.');
     if (rows[0].resolved_at) throw new HttpError(409, 'This escalation is already closed.');
-    const { rows: done } = await db.query('UPDATE escalations SET resolved_at = SYSDATETIMEOFFSET(), resolved_by = $2 OUTPUT INSERTED.* WHERE id = $1', [id, req.user!.id]);
-    await logActivity(db, task.projectId, req.user!.id, 'escalation.resolved', { taskId: rows[0].task_id, name: task.name, level: rows[0].level });
+    // Closing closes the whole line on this milestone: a lower step left open would climb straight back up.
+    const { rows: closed } = await db.query('UPDATE escalations SET resolved_at = SYSDATETIMEOFFSET(), resolved_by = $2 OUTPUT INSERTED.* WHERE task_id = $1 AND resolved_at IS NULL', [rows[0].task_id, req.user!.id]);
+    const done = closed.filter((e) => e.id === id);
+    await logActivity(db, task.projectId, req.user!.id, 'escalation.resolved', { taskId: rows[0].task_id, name: task.name, level: rows[0].level, closed: closed.length });
     res.json(mapEscalation(done[0]));
   }),
 );

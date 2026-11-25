@@ -1,6 +1,7 @@
 import { db } from './db';
 import { aiEnabled, askModel, STR, text } from './ai';
 import { appBase, mailEnabled, sendMail } from './mail';
+import { CLOSED_FOR_DEADLINE } from './escalation';
 import { escalationEmail, followupEmail } from './followupEmail';
 import type { EscalationItem, FollowupItem } from './followupEmail';
 import { buildMatcher } from './people';
@@ -139,7 +140,7 @@ export async function planEscalations(today = todayIso(), test = false): Promise
               (SELECT TOP (1) f.user_id FROM followups f WHERE f.task_id = t.id AND f.test = $1 ORDER BY f.sent_at DESC) AS asked_id,
               (SELECT TOP (1) f.sent_to FROM followups f WHERE f.task_id = t.id AND f.test = $1 ORDER BY f.sent_at DESC) AS asked_to
          FROM tasks t JOIN projects p ON p.id = t.project_id LEFT JOIN departments d ON d.id = p.department_id
-        WHERE ${OPEN_MILESTONES}) x
+        WHERE ${OPEN_MILESTONES} AND NOT ${CLOSED_FOR_DEADLINE}) x
       WHERE x.unanswered >= $2
       ORDER BY x.due, x.id`,
     [test, after],

@@ -17,6 +17,13 @@ export const CLIMB_AFTER: Record<number, number> = { 1: 2, 2: 2, 3: 2, 4: 2, 5: 
 export const CEO_REMIND_AFTER = 3;
 export const TOP = 6;
 
+/**
+ * SQL (for a task aliased t): an escalation on it was closed on or after its current deadline. Closing means it was
+ * dealt with for this deadline, so nothing raises it again automatically until the milestone has a new date.
+ */
+export const CLOSED_FOR_DEADLINE = `EXISTS (SELECT 1 FROM escalations ec WHERE ec.task_id = t.id AND ec.resolved_at IS NOT NULL
+  AND CAST(ec.resolved_at AT TIME ZONE 'Arab Standard Time' AS DATE) >= t.end_date)`;
+
 export async function ladder(q: Queryable, taskId: number): Promise<(EscalationStep & { userIds: number[] })[]> {
   const { rows } = await q.query(
     `SELECT p.manager_id, m.name AS manager_name,

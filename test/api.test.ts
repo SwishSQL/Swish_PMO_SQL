@@ -1486,6 +1486,7 @@ test('change requests: after the baseline, scope, cost and schedule change only 
 });
 
 test('the transformation plan: capabilities, dimensions and plan projects, with the projects linked under them', async () => {
+
   assert.deepEqual((await member('GET', '/api/transformation')).body, [], 'not for team members');
   const plan = (await owner('GET', '/api/transformation')).body;
   assert.equal(plan.length, 7, 'seven capabilities from the workbook');
@@ -1567,6 +1568,20 @@ test('the transformation plan: capabilities, dimensions and plan projects, with 
 
   // Clearing a link.
   assert.equal((await owner('POST', '/api/transformation/links', { links: [{ projectId: ids.project, initiativeId: null }] })).body.saved, 1);
+});
+
+test('the PMO adds a program to a portfolio; nobody else can', async () => {
+  // The PMO adds a program to a portfolio; nobody else can, and a portfolio has each name once.
+  const cap = (await owner('GET', '/api/transformation')).body[0];
+  assert.equal((await pm('POST', '/api/transformation/dimensions', { capabilityId: cap.id, name: 'New program' })).status, 403);
+  assert.equal((await head('POST', '/api/transformation/dimensions', { capabilityId: cap.id, name: 'New program' })).status, 403);
+  const added = await owner('POST', '/api/transformation/dimensions', { capabilityId: cap.id, name: 'New program', managerUserId: ids.head });
+  assert.equal(added.status, 201, JSON.stringify(added.body));
+  assert.equal((await owner('POST', '/api/transformation/dimensions', { capabilityId: cap.id, name: 'new  PROGRAM' })).status, 409);
+  assert.equal((await owner('POST', '/api/transformation/dimensions', { capabilityId: cap.id, name: ' ' })).status, 400);
+  const dim = (await owner('GET', '/api/transformation')).body[0].dimensions.find((d: any) => d.id === added.body.id);
+  assert.equal(dim.name, 'New program');
+  assert.equal(dim.managerUserId, ids.head);
 });
 
 test('the milestones tracker: preview, create new projects, update only status/%/comment/blocker, dates recovered from "days"', async () => {
@@ -2178,6 +2193,12 @@ test('an escalation nobody answers climbs the ladder by itself, one level per wa
   assert.deepEqual(await levels(), [1, 2, 4, 6], 'and no further');
   const auto = (await owner('GET', `/api/tasks/${ms.id}/escalations`)).body.find((e: any) => e.level === 2);
   assert.match(auto.note, /Raised automatically/);
+  // Closing the top step closes the whole line, so nothing climbs back up afterwards.
+  const top = (await owner('GET', `/api/tasks/${ms.id}/escalations`)).body.find((e: any) => e.level === 6 && !e.resolvedAt);
+  assert.equal((await owner('POST', `/api/escalations/${top.id}/resolve`)).status, 200);
+  assert.deepEqual(await levels(), [], 'every step is closed');
+  await owner('POST', '/api/escalations/climb', { today: later });
+  assert.deepEqual(await levels(), [], 'and none is raised again');
 });
 
 test('an account can be made now and its setup email sent later, one by one or to everyone at once', async () => {

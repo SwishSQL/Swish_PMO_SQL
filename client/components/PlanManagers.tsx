@@ -1,5 +1,6 @@
 import { useState } from 'react';
-import { UserCircle } from '@phosphor-icons/react';
+import { Plus, UserCircle } from '@phosphor-icons/react';
+import { Dialog, Field } from './ui';
 import { api } from '../api';
 import { useApp, useLoad, useToast } from '../lib/app';
 import { useT } from '../lib/i18n';
@@ -88,5 +89,88 @@ export function LadderRoles() {
         </div>
       </div>
     </section>
+  );
+}
+
+/** The PMO adds a program (dimension) to the portfolio on screen: its name and, if known, who leads it. */
+export function AddProgramButton({ capabilityId, capabilityName, onAdded }: { capabilityId: number; capabilityName: string; onAdded: () => void }) {
+  const { t } = useT();
+  const { meta, can } = useApp();
+  const toast = useToast();
+  const [open, setOpen] = useState(false);
+  const [name, setName] = useState('');
+  const [manager, setManager] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  if (!can('projects.edit_all')) return null;
+  const close = () => {
+    setOpen(false);
+    setName('');
+    setManager('');
+    setError(null);
+  };
+  const save = async () => {
+    if (!name.trim()) return setError(t('ap_nameNeeded'));
+    setBusy(true);
+    setError(null);
+    try {
+      await api.post('/api/transformation/dimensions', { capabilityId, name: name.trim(), managerUserId: manager ? Number(manager) : null });
+      toast(t('ap_added', { name: name.trim() }));
+      close();
+      onAdded();
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
+      setBusy(false);
+    }
+  };
+  return (
+    <>
+      <button type="button" className="btn btn-sm" onClick={() => setOpen(true)}>
+        <Plus size={14} weight="bold" aria-hidden />
+        {t('ap_button')}
+      </button>
+      {open && (
+        <Dialog
+          title={t('ap_title', { portfolio: capabilityName })}
+          onClose={close}
+          width={480}
+          footer={
+            <>
+              {error && (
+                <span className="field-error" role="alert" style={{ marginInlineEnd: 'auto', alignSelf: 'center' }}>
+                  {error}
+                </span>
+              )}
+              <button className="btn" onClick={close}>
+                {t('cancel')}
+              </button>
+              <button className="btn btn-primary" disabled={busy} onClick={save}>
+                {t('ap_button')}
+              </button>
+            </>
+          }
+        >
+          <div className="form-grid">
+            <Field label={`${t('ap_name')} *`} className="span-2">
+              <input className="input" autoFocus value={name} maxLength={160} dir="auto" onChange={(e) => (setName(e.target.value), setError(null))} />
+            </Field>
+            <Field label={t('pp_programManager')} hint={t('ap_managerHint')} className="span-2">
+              <select className="select" value={manager} onChange={(e) => setManager(e.target.value)}>
+                <option value="">{t('pp_notSet')}</option>
+                {meta.users
+                  .filter((u) => u.active)
+                  .sort((a, b) => a.name.localeCompare(b.name))
+                  .map((u) => (
+                    <option key={u.id} value={u.id}>
+                      {u.name}
+                    </option>
+                  ))}
+              </select>
+            </Field>
+          </div>
+        </Dialog>
+      )}
+    </>
   );
 }
