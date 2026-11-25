@@ -64,8 +64,8 @@ again at every start).
    MSSQL_TRUST_CERT=true        # false when the server has a certificate the machine trusts
    PORT=<the port>
    APP_URL=https://<the address people will use>
-   OWNER_EMAIL=<the owner's @swishhh.net address>
-   OWNER_NAME=<their name>
+   OWNER_EMAIL=<the owner's @swishhh.net address, or several separated by commas>
+   OWNER_NAME=<their name, or several separated by commas in the same order>
    ```
 
    (`DATABASE_URL=sqlserver://user:password@host:1433/database` works instead of the separate `MSSQL_*` settings.)
@@ -74,7 +74,7 @@ again at every start).
    systems). Check `http://<server>:<port>/api/health`: it answers `{"ok":true,"db":"sqlserver"}` only when the database
    answers.
 
-5. The first start prints the owner's one-time setup link (`/#/activate/<token>`) in the log. The owner opens it, chooses a
+5. The first start prints each owner's one-time setup link (`/#/activate/<token>`) in the log. Each owner opens theirs, chooses a
    password, and adds the other people from **Users & permissions**. No password is ever kept in code or in `.env`.
 
 ## Moving the data from the PostgreSQL edition

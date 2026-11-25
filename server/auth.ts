@@ -6,6 +6,7 @@ import type { Queryable } from './db';
 import type { Permission, User } from '../shared/types';
 import { ADMIN_ROLE_ID, normalizePermissions } from '../shared/permissions';
 import { mapUser } from './mappers';
+import { isOwnerEmail } from './ownerEmails';
 import { projectVisibleSql } from './visibility';
 import { managesSql } from './visibility';
 
@@ -26,15 +27,11 @@ declare global {
 
 /**
  * The owner account is protected: always active, always on the Admin role,
- * so the system can never lock everyone out. Set OWNER_EMAIL on the server.
+ * so the system can never lock everyone out. Set OWNER_EMAIL on the server (several owners: separate the addresses
+ * with commas).
  */
-export function ownerEmail(): string | null {
-  const e = (process.env.OWNER_EMAIL ?? '').trim().toLowerCase();
-  return e || null;
-}
-
 export function isOwner(email: string): boolean {
-  return email.trim().toLowerCase() === ownerEmail();
+  return isOwnerEmail(email);
 }
 
 export function hashPassword(plain: string): Promise<string> {

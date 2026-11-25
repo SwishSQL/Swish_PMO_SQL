@@ -2,7 +2,8 @@
 // owner account). Projects come from the tracker through `npm run import`.
 
 import { db } from './db';
-import { INVITE_DAYS, issueInvite, ownerEmail } from './auth';
+import { INVITE_DAYS, issueInvite } from './auth';
+import { ownerEmails, ownerName } from './ownerEmails';
 import { ADMIN_ROLE_ID, COMPANY_DOMAIN, DEFAULT_ROLES, isCompanyEmail } from '../shared/permissions';
 import { quarterRange, todayIso } from '../shared/dates';
 
@@ -88,13 +89,17 @@ export async function seedReference(): Promise<void> {
   // above the owner to send a setup link, so while the account is not set up,
   // each boot writes a fresh link to the server log (readable only by people
   // with access to the hosting project).
-  const owner = ownerEmail();
-  if (!owner) {
+  const owners = ownerEmails();
+  if (!owners.length) {
     console.warn("[seed] OWNER_EMAIL is not set. Set it to the owner's @swishhh.net email so someone can sign in.");
     return;
   }
+  for (const owner of owners) await seedOwner(owner);
+}
+
+async function seedOwner(owner: string): Promise<void> {
   if (!isCompanyEmail(owner)) {
-    console.warn(`[seed] OWNER_EMAIL must be a ${COMPANY_DOMAIN} address. No owner account was created.`);
+    console.warn(`[seed] OWNER_EMAIL must be a ${COMPANY_DOMAIN} address. No account was created for ${owner}.`);
     return;
   }
   let { rows } = await db.query(
@@ -104,13 +109,13 @@ export async function seedReference(): Promise<void> {
   if (!rows.length) {
     ({ rows } = await db.query(
       `INSERT INTO users (email, name, role_id, title, must_set_password) OUTPUT INSERTED.id, INSERTED.must_set_password, CAST(1 AS BIT) AS inserted VALUES ($1, $2, $3, 'System owner', 1)`,
-      [owner, process.env.OWNER_NAME || 'Owner', ADMIN_ROLE_ID],
+      [owner, ownerName(owner), ADMIN_ROLE_ID],
     ));
   }
   if (rows[0]?.inserted) console.log(`[seed] Added owner ${owner}.`);
   if (rows[0]?.must_set_password) {
     const { token } = await issueInvite(db, rows[0].id, null);
-    console.log(`[seed] The owner account is not set up yet. Setup link (valid ${INVITE_DAYS} days, one use): ${setupLink(token)}`);
+    console.log(`[seed] The owner account ${owner} is not set up yet. Setup link (valid ${INVITE_DAYS} days, one use): ${setupLink(token)}`);
   }
 }
 

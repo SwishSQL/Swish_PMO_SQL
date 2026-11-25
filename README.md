@@ -68,7 +68,7 @@ The same model as the other SWiSH systems. No password lives in code or in an
 environment variable.
 
 - Only `@swishhh.net` emails can have accounts.
-- Nobody can sign up. `OWNER_EMAIL` is the protected owner: always active,
+- Nobody can sign up. `OWNER_EMAIL` lists the protected owners (one address, or several separated by commas): always active,
   always PMO admin. The owner and the system admins the owner appoints are the
   only accounts that can create accounts, reset passwords and edit roles and
   permissions. No role can be given that power, not even PMO admin.

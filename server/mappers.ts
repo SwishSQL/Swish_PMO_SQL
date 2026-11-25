@@ -16,6 +16,7 @@ import type {
   User,
 } from '../shared/types';
 import { normalizePermissions } from '../shared/permissions';
+import { isOwnerEmail } from './ownerEmails';
 
 const iso = (v: unknown): string => (v instanceof Date ? v.toISOString() : String(v));
 const num = (v: unknown): number | null => (v === null || v === undefined ? null : Number(v));
@@ -39,10 +40,8 @@ export function mapUser(r: any): User {
     lastLoginAt: r.last_login_at ? iso(r.last_login_at) : null,
     /** False while the account's setup email has not gone out (held until launch). */
     setupEmailed: r.setup_emailed_at !== undefined ? r.setup_emailed_at !== null : undefined,
-    owner: String(r.email).toLowerCase() === (process.env.OWNER_EMAIL ?? '').trim().toLowerCase(),
-    systemAdmin:
-      Boolean(r.is_system_admin) ||
-      String(r.email).toLowerCase() === (process.env.OWNER_EMAIL ?? '').trim().toLowerCase(),
+    owner: isOwnerEmail(String(r.email)),
+    systemAdmin: Boolean(r.is_system_admin) || isOwnerEmail(String(r.email)),
   };
 }
 
